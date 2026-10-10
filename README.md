@@ -15,6 +15,11 @@
 4. Do NOT add android:extractNativeLibs="false" - the libs must be real files on disk.
    (Manifest in your APK has no such attribute -> libs are extracted at install = good.)
 
+## v2 note
+The driver is now loaded lazily on the first vk call (not in the constructor), because libadrenotools'
+internal init (linkernsbypass) had not run yet when v1 called it -> v1 returned NULL with no dlerror.
+The log now prints `linkernsbypass_load_status()` and tries 3 call variants (A/B/C).
+
 ## After one launch (even a crash) send me, from /sdcard/Android/data/com.rockstargames.rdr/files/vkshim_logs/
 - vkshim.log   (everything: device, file checks, dlerror, driver load result, selftest GPU/apiVersion, every vkCreateInstance/Device, null proc addrs)
 - vkshim.prev.log (previous run)
