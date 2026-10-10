@@ -39,6 +39,8 @@
 
 extern "C" {
 HID void* vkshim_tbl[VKSHIM_COUNT];
+HID void vkshim_ret0();                // asm: returns 0
+bool linkernsbypass_load_status();     // from libadrenotools' linkernsbypass (static)
 }
 
 // ------------------------------------------------------------------ logger
@@ -429,9 +431,20 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL h_GetDeviceProcAddr(VkDevice d, const c
 }
 }  // namespace
 
-extern "C" HID unsigned long vkshim_missing(int idx) {
-  logf("CALLED UNRESOLVED EXPORT: %s", (idx >= 0 && idx < VKSHIM_COUNT) ? kNames[idx] : "?");
-  return 0;
+namespace { void lazyInit(); std::once_flag g_once; bool g_missLogged[VKSHIM_COUNT]; }
+
+// called from the asm slow path (tramp.S) the first time an exported vk* is used.
+extern "C" HID void* vkshim_resolve(int idx) {
+  std::call_once(g_once, lazyInit);
+  void* p = (idx >= 0 && idx < VKSHIM_COUNT) ? vkshim_tbl[idx] : nullptr;
+  if (!p) {
+    if (idx >= 0 && idx < VKSHIM_COUNT && !g_missLogged[idx]) {
+      g_missLogged[idx] = true;
+      logf("CALLED UNRESOLVED EXPORT (returns 0): %s", kNames[idx]);
+    }
+    return (void*)vkshim_ret0;
+  }
+  return p;
 }
 
 namespace {
@@ -471,13 +484,25 @@ void* loadVulkan() {
     logf("NO DRIVER FILE FOUND (looked for libvulkan_purple.so / vulkan.purple.so in %s and %s/../driver)", g_nlib.c_str(), g_logdir.c_str());
   } else {
     logf("driver: %s/%s size=%ld", drvDir.c_str(), drvName.c_str(), fsize(drvDir + "/" + drvName));
-    logf("calling adrenotools_open_libvulkan(flags=RTLD_NOW|RTLD_LOCAL feature=CUSTOM tmp=%s hook=%s drvdir=%s drv=%s)",
-         tmp.c_str(), g_nlib.c_str(), drvDir.c_str(), drvName.c_str());
-    dlerror();
-    void* h = adrenotools_open_libvulkan(RTLD_NOW | RTLD_LOCAL, ADRENOTOOLS_DRIVER_CUSTOM, tmp.c_str(), (g_nlib + "/").c_str(),
-                                         (drvDir + "/").c_str(), drvName.c_str(), nullptr, nullptr);
-    const char* err = dlerror();
-    logf("adrenotools_open_libvulkan -> handle=%p dlerror=%s", h, err ? err : "(none)");
+    logf("linkernsbypass_load_status()=%d (0 = adrenotools refuses to work)", (int)linkernsbypass_load_status());
+    std::string redir = g_intdir + "/files/vkshim_redirect";
+    mkdirs(redir);
+    struct Try { const char* name; int flags; const char* tmpd; const char* redir; } tries[] = {
+        {"A: CUSTOM, tmp dir", ADRENOTOOLS_DRIVER_CUSTOM, tmp.c_str(), nullptr},
+        {"B: CUSTOM, tmp=null", ADRENOTOOLS_DRIVER_CUSTOM, nullptr, nullptr},
+        {"C: CUSTOM|FILE_REDIRECT", ADRENOTOOLS_DRIVER_CUSTOM | ADRENOTOOLS_DRIVER_FILE_REDIRECT, tmp.c_str(), redir.c_str()},
+    };
+    void* h = nullptr;
+    for (auto& t : tries) {
+      logf("try %s: hook=%s drvdir=%s drv=%s", t.name, g_nlib.c_str(), drvDir.c_str(), drvName.c_str());
+      dlerror();
+      h = adrenotools_open_libvulkan(RTLD_NOW | RTLD_LOCAL, t.flags, t.tmpd, (g_nlib + "/").c_str(),
+                                     (drvDir + "/").c_str(), drvName.c_str(), t.redir, nullptr);
+      const char* err = dlerror();
+      logf("  -> handle=%p dlerror=%s", h, err ? err : "(none)");
+      if (h) break;
+    }
+    const char* err = nullptr;
     logMapsMatching("purple", "linkernsbypass");
     if (h) { g_custom = true; return h; }
     logf("custom driver load FAILED (see dlerror above, and the 'required files' list at the top)");
@@ -527,10 +552,9 @@ void selfTest() {
   logf("---- selftest done ----");
 }
 
-__attribute__((constructor)) void shimInit() {
-  initPaths();
-  installCrashHandlers();
-  environmentReport();
+void lazyInit() {
+  logf("lazyInit: first Vulkan call from the game; loading driver now (linkernsbypass_load_status=%d)",
+       (int)linkernsbypass_load_status());
   g_vk = loadVulkan();
   if (!g_vk) { logf("FATAL: no libvulkan handle at all"); return; }
   real_gipa = (PFN_vkGetInstanceProcAddr)dlsym(g_vk, "vkGetInstanceProcAddr");
@@ -545,8 +569,15 @@ __attribute__((constructor)) void shimInit() {
     void* p = dlsym(g_vk, kNames[i]);
     if (p) { vkshim_tbl[i] = p; ok++; } else miss++;
   }
-  logf("export table: %d forwarded, %d hooked, %d not exported by loader (calls to those are logged as UNRESOLVED; games normally fetch them via vkGet*ProcAddr)", ok, hooked, miss);
+  logf("export table: %d forwarded, %d hooked, %d not exported by loader (logged as UNRESOLVED only if the game calls them directly; most are fetched via vkGet*ProcAddr)", ok, hooked, miss);
   selfTest();
   logf("==== vkshim ready (custom_driver=%d) ====", (int)g_custom);
+}
+
+__attribute__((constructor)) void shimInit() {
+  initPaths();
+  installCrashHandlers();
+  environmentReport();
+  logf("constructor done; driver load is deferred to the first vk call so libadrenotools' own static init has run");
 }
 }  // namespace
