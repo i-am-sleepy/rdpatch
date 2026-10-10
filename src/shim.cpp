@@ -35,6 +35,7 @@
 #define HID __attribute__((visibility("hidden")))
 #define EXP __attribute__((visibility("default")))
 
+#include "datalink.h"
 #include "names.inc"
 
 extern "C" {
@@ -463,7 +464,7 @@ bool copyFile(const std::string& from, const std::string& to) {
 }
 
 void* loadVulkan() {
-  std::string tmp = g_intdir + "/files/vkshim_tmp";
+  std::string tmp = g_intdir + "/code_cache/vkshim_tmp";
   mkdirs(tmp);
   logf("tmpLibDir=%s exists=%d", tmp.c_str(), (int)exists(tmp));
   // driver can live next to the shim (preferred, packed into the APK as libvulkan_purple.so) ...
@@ -474,7 +475,7 @@ void* loadVulkan() {
   if (drvName.empty()) {
     std::string ext = g_logdir + "/../driver/vulkan.purple.so";
     if (exists(ext)) {
-      std::string dst = g_intdir + "/files/vkshim_driver";
+      std::string dst = g_intdir + "/code_cache/vkshim_driver";
       mkdirs(dst);
       logf("copying driver from %s to %s", ext.c_str(), dst.c_str());
       if (copyFile(ext, dst + "/vulkan.purple.so")) { drvDir = dst; drvName = "vulkan.purple.so"; }
@@ -485,7 +486,7 @@ void* loadVulkan() {
   } else {
     logf("driver: %s/%s size=%ld", drvDir.c_str(), drvName.c_str(), fsize(drvDir + "/" + drvName));
     logf("linkernsbypass_load_status()=%d (0 = adrenotools refuses to work)", (int)linkernsbypass_load_status());
-    std::string redir = g_intdir + "/files/vkshim_redirect";
+    std::string redir = g_intdir + "/code_cache/vkshim_redirect";
     mkdirs(redir);
     struct Try { const char* name; int flags; const char* tmpd; const char* redir; } tries[] = {
         {"A: CUSTOM, tmp dir", ADRENOTOOLS_DRIVER_CUSTOM, tmp.c_str(), nullptr},
@@ -578,6 +579,10 @@ __attribute__((constructor)) void shimInit() {
   initPaths();
   installCrashHandlers();
   environmentReport();
+  {  // safety net: normally libdatalink.so (loaded from Java) already did this; running again is a no-op
+    datalink::Ctx dc;
+    if (datalink::detect(dc)) logf("datalink (from shim): %d folder(s) linked, see Android/media/%s/datalink.log", datalink::run(dc), g_pkg.c_str());
+  }
   logf("constructor done; driver load is deferred to the first vk call so libadrenotools' own static init has run");
 }
 }  // namespace
