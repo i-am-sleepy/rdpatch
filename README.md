@@ -20,4 +20,10 @@ The driver is now loaded lazily on the first vk call (not in the constructor), b
 internal init (linkernsbypass) had not run yet when v1 called it -> v1 returned NULL with no dlerror.
 The log now prints `linkernsbypass_load_status()` and tries 3 call variants (A/B/C).
 
-well game works now I don't care anymore🥲
+## After one launch (even a crash) send me, from /sdcard/Android/data/com.rockstargames.rdr/files/vkshim_logs/
+- vkshim.log   (everything: device, file checks, dlerror, driver load result, selftest GPU/apiVersion, every vkCreateInstance/Device, null proc addrs)
+- vkshim.prev.log (previous run)
+- crash_*.txt  (registers, backtrace with module+offset, last 256 log lines, thread list, full maps)
+- `adb`-less logcat is not needed; the same lines are also in logcat tag `vkshim`.
+
+Create an empty file named NO_SELFTEST in that folder to skip the throwaway-instance selftest.
