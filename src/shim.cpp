@@ -91,6 +91,10 @@ int g_clamp = 0;       // CLAMP_QUEUES: give the game only as many queues as the
 int g_launder = 0;     // ACQUIRE_LAUNDER: re-signal acquire semaphores through a normal GPU submit
 std::mutex g_qlock;    // serialises queue use when CLAMP_QUEUES / ACQUIRE_LAUNDER are on
 std::map<uint32_t, uint32_t> g_famAdv;  // family -> number of queues the driver really offers (only filled when clamping)
+int g_dedup = 0;       // DEDUP_WAITS: drop a semaphore wait when the semaphore has no signal pending (game waits twice on one signal)
+int g_strip = 0;       // STRIP_SEMAPHORES: remove every semaphore wait/signal from submits+present, wait for the GPU on the CPU instead
+std::map<uintptr_t, int> g_semPending;  // semaphore -> signals not yet consumed by a wait
+std::mutex g_semm;
 int g_serialize = 0;   // SERIALIZE_SUBMITS: 1 = wait for the queue after every submit, 2 = wait for the whole device
 bool g_verbose = false;  // VKSHIM_VERBOSE=1 in tu_env.txt: every traced call also goes to the log file
 
@@ -561,13 +565,24 @@ std::string qname(VkQueue q) {
 }
 struct QLock {  // held while the game uses a queue, only when a setting that merges/reorders queue use is active
   std::unique_lock<std::mutex> lk;
-  QLock() : lk(g_qlock, std::defer_lock) { if (g_clamp || g_launder) lk.lock(); }
+  QLock() : lk(g_qlock, std::defer_lock) { if (g_clamp || g_launder || g_strip) lk.lock(); }
 };
 std::string semList(const VkSemaphore* s, uint32_t n) {
   std::string o = "[";
   for (uint32_t i = 0; s && i < n && i < 4; i++) { char b[32]; snprintf(b, sizeof b, "%s%p", i ? "," : "", (void*)s[i]); o += b; }
   if (n > 4) o += ",...";
   return o + "]";
+}
+void semSignal(VkSemaphore s) {
+  std::lock_guard<std::mutex> lk(g_semm);
+  g_semPending[(uintptr_t)s]++;
+}
+// returns true if the wait is backed by a pending signal (and consumes it), false if it is a repeat wait
+bool semWait(VkSemaphore s) {
+  std::lock_guard<std::mutex> lk(g_semm);
+  int& c = g_semPending[(uintptr_t)s];
+  if (c > 0) { c--; return true; }
+  return false;
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL h_EnumerateDeviceExtensionProperties(VkPhysicalDevice pd, const char* layer, uint32_t* pCount,
@@ -684,7 +699,7 @@ VKAPI_ATTR VkResult VKAPI_CALL h_GetSwapchainImagesKHR(VkDevice d, VkSwapchainKH
 
 // ACQUIRE_LAUNDER: waits for the acquire semaphore on the GPU queue and signals it again from a normal submit, so later waits
 // never depend on the window system's native fence. Also logs whether that step itself works.
-void launderSemaphore(VkDevice d, VkSemaphore sem) {
+void launderSemaphore(VkDevice d, VkSemaphore sem, bool resignal) {
   static PFN_vkCreateFence cf;
   static PFN_vkDestroyFence df;
   static PFN_vkWaitForFences wf;
@@ -711,8 +726,8 @@ void launderSemaphore(VkDevice d, VkSemaphore sem) {
   si.waitSemaphoreCount = 1;
   si.pWaitSemaphores = &sem;
   si.pWaitDstStageMask = &stage;
-  si.signalSemaphoreCount = 1;
-  si.pSignalSemaphores = &sem;
+  si.signalSemaphoreCount = resignal ? 1 : 0;
+  si.pSignalSemaphores = resignal ? &sem : nullptr;
   VkResult r1, r2;
   {
     QLock ql;
@@ -722,7 +737,7 @@ void launderSemaphore(VkDevice d, VkSemaphore sem) {
   df(d, f, nullptr);
   static std::atomic<int> k{0};
   if (k.fetch_add(1) < 6 || r2 != VK_SUCCESS)
-    logf("ACQUIRE_LAUNDER: re-signal submit -> %s, wait -> %s", vkres((int)r1), vkres((int)r2));
+    logf("%s: submit -> %s, wait -> %s", resignal ? "ACQUIRE_LAUNDER" : "STRIP_SEMAPHORES(acquire consumed on CPU)", vkres((int)r1), vkres((int)r2));
   note("acquire-launder", r2);
 }
 
@@ -735,14 +750,41 @@ VKAPI_ATTR VkResult VKAPI_CALL h_AcquireNextImageKHR(VkDevice d, VkSwapchainKHR 
   tracef("acquire#%ld sc=%p sem=%p fence=%p -> %s idx=%u", n, (void*)sc, (void*)sem, (void*)fence, vkres((int)res), idx ? *idx : 0u);
   if (n <= 4) logf("vkAcquireNextImageKHR #%ld -> %s idx=%u sem=%p fence=%p", n, vkres((int)res), idx ? *idx : 0u, (void*)sem, (void*)fence);
   note("vkAcquireNextImageKHR", res);
-  if (g_launder && sem != VK_NULL_HANDLE && (res == VK_SUCCESS || res == VK_SUBOPTIMAL_KHR)) launderSemaphore(d, sem);
+  if (sem != VK_NULL_HANDLE && (res == VK_SUCCESS || res == VK_SUBOPTIMAL_KHR)) {
+    if (g_strip) launderSemaphore(d, sem, false);        // consume on the CPU; nobody waits on it afterwards
+    else {
+      if (g_dedup) semSignal(sem);                        // acquire counts as one signal
+      if (g_launder) launderSemaphore(d, sem, true);
+    }
+  }
   return res;
 }
 VKAPI_ATTR VkResult VKAPI_CALL h_QueuePresentKHR(VkQueue q, const VkPresentInfoKHR* pi) {
   static PFN_vkQueuePresentKHR r;
   if (!r) r = devFn<PFN_vkQueuePresentKHR>("vkQueuePresentKHR");
   QLock ql;
-  VkResult res = r ? r(q, pi) : VK_ERROR_INITIALIZATION_FAILED;
+  VkPresentInfoKHR pi2;
+  std::vector<VkSemaphore> pw;
+  const VkPresentInfoKHR* usePi = pi;
+  if (pi && (g_strip || g_dedup)) {
+    pi2 = *pi;
+    if (g_strip) {
+      pi2.waitSemaphoreCount = 0;
+      pi2.pWaitSemaphores = nullptr;
+      usePi = &pi2;
+    } else {
+      for (uint32_t j = 0; j < pi->waitSemaphoreCount; j++) {
+        if (semWait(pi->pWaitSemaphores[j])) pw.push_back(pi->pWaitSemaphores[j]);
+        else logf("DEDUP_WAITS: present dropped repeat wait on semaphore %p (no signal pending)", (void*)pi->pWaitSemaphores[j]);
+      }
+      if (pw.size() != pi->waitSemaphoreCount) {
+        pi2.waitSemaphoreCount = (uint32_t)pw.size();
+        pi2.pWaitSemaphores = pw.empty() ? nullptr : pw.data();
+        usePi = &pi2;
+      }
+    }
+  }
+  VkResult res = r ? r(q, usePi) : VK_ERROR_INITIALIZATION_FAILED;
   long n = ++g_nPresent;
   tracef("present#%ld queue=%s waitSems=%s swapchains=%u -> %s", n, qname(q).c_str(), pi ? semList(pi->pWaitSemaphores, pi->waitSemaphoreCount).c_str() : "[]", pi ? pi->swapchainCount : 0u, vkres((int)res));
   if (n <= 4) logf("vkQueuePresentKHR #%ld queue=%s waitSems=%s -> %s (pNext sTypes: %s)", n, qname(q).c_str(), pi ? semList(pi->pWaitSemaphores, pi->waitSemaphoreCount).c_str() : "[]", vkres((int)res), pi ? pnextChain(pi->pNext).c_str() : "");
@@ -862,8 +904,49 @@ VKAPI_ATTR VkResult VKAPI_CALL h_QueueSubmit(VkQueue q, uint32_t cnt, const VkSu
   std::string qn = qname(q);
   std::string wl = si && cnt ? semList(si[0].pWaitSemaphores, si[0].waitSemaphoreCount) : "[]";
   std::string sl = si && cnt ? semList(si[0].pSignalSemaphores, si[0].signalSemaphoreCount) : "[]";
+  // optional rewriting of semaphore use (DEDUP_WAITS / STRIP_SEMAPHORES)
+  std::vector<VkSubmitInfo> rw;
+  std::vector<std::vector<VkSemaphore>> rwWait(cnt);
+  std::vector<std::vector<VkPipelineStageFlags>> rwStage(cnt);
+  bool modified = false;
+  if (si && cnt && (g_strip || g_dedup)) {
+    rw.assign(si, si + cnt);
+    for (uint32_t i = 0; i < cnt; i++) {
+      VkSubmitInfo& b = rw[i];
+      if (g_strip) {
+        b.waitSemaphoreCount = 0;
+        b.pWaitSemaphores = nullptr;
+        b.pWaitDstStageMask = nullptr;
+        b.signalSemaphoreCount = 0;
+        b.pSignalSemaphores = nullptr;
+        b.pNext = nullptr;
+        modified = true;
+        continue;
+      }
+      bool dropped = false;
+      for (uint32_t j = 0; j < si[i].waitSemaphoreCount; j++) {
+        VkSemaphore sm = si[i].pWaitSemaphores[j];
+        bool backed = semWait(sm);
+        if (!backed && !si[i].pNext) {   // with a pNext (timeline values) we never edit the lists
+          dropped = true;
+          static std::atomic<int> dk{0};
+          if (dk.fetch_add(1) < 60) logf("DEDUP_WAITS: submit #%ld dropped repeat wait on semaphore %p (no signal pending)", n, (void*)sm);
+          continue;
+        }
+        rwWait[i].push_back(sm);
+        rwStage[i].push_back(si[i].pWaitDstStageMask ? si[i].pWaitDstStageMask[j] : (VkPipelineStageFlags)0x1);
+      }
+      if (dropped) {
+        b.waitSemaphoreCount = (uint32_t)rwWait[i].size();
+        b.pWaitSemaphores = rwWait[i].empty() ? nullptr : rwWait[i].data();
+        b.pWaitDstStageMask = rwStage[i].empty() ? nullptr : rwStage[i].data();
+        modified = true;
+      }
+      for (uint32_t j = 0; j < si[i].signalSemaphoreCount; j++) semSignal(si[i].pSignalSemaphores[j]);
+    }
+  }
   double t0 = nowSec();
-  VkResult res = r ? r(q, cnt, si, fence) : VK_ERROR_INITIALIZATION_FAILED;
+  VkResult res = r ? r(q, cnt, modified ? rw.data() : si, fence) : VK_ERROR_INITIALIZATION_FAILED;
   double dt = nowSec() - t0;
   char what[160];
   snprintf(what, sizeof what, "renderpasses=%ld pipelineBinds=%ld draws=%ld dispatches=%ld bufToImageCopies=%ld", cRP, cBind, cDraw, cDisp, cCopy);
@@ -874,13 +957,15 @@ VKAPI_ATTR VkResult VKAPI_CALL h_QueueSubmit(VkQueue q, uint32_t cnt, const VkSu
          fence ? "yes" : "no", vkres((int)res), what);
   if (dt > 0.25) logf("slow vkQueueSubmit #%ld took %.0f ms", n, dt * 1000);
   note("vkQueueSubmit", res);
-  if (res == VK_SUCCESS && g_serialize > 0) {
+  int ser = g_serialize;
+  if (g_strip && !ser) ser = 1;
+  if (res == VK_SUCCESS && ser > 0) {
     static PFN_vkQueueWaitIdle wi;
     static PFN_vkDeviceWaitIdle dw;
     if (!wi) wi = devFn<PFN_vkQueueWaitIdle>("vkQueueWaitIdle");
     if (!dw) dw = devFn<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle");
     double w0 = nowSec();
-    VkResult wr = (g_serialize >= 2 && dw) ? dw(g_dev) : (wi ? wi(q) : VK_SUCCESS);
+    VkResult wr = (ser >= 2 && dw) ? dw(g_dev) : (wi ? wi(q) : VK_SUCCESS);
     double wd = nowSec() - w0;
     tracef("serialize: GPU finished submit#%ld on %s -> %s (%.1f ms)", n, qn.c_str(), vkres((int)wr), wd * 1000);
     if (n <= 40 || wr != VK_SUCCESS)
@@ -1195,6 +1280,14 @@ const char* kEnvTemplate =
     "# FIX ATTEMPT B: after every image acquire, re-signal the swapchain semaphore through a normal GPU submit.\n"
     "#ACQUIRE_LAUNDER=1\n"
     "#\n"
+    "# FIX ATTEMPT C: the game waits twice on some semaphores after only one signal (invalid, harmless on some\n"
+    "# drivers). This drops such repeated waits. Cheap, keeps full speed.\n"
+    "#DEDUP_WAITS=1\n"
+    "#\n"
+    "# FIX ATTEMPT D (slow, last resort): remove ALL semaphore waits/signals; the shim waits for the GPU on the\n"
+    "# CPU after every submit instead. If even this fails, semaphores are not the problem.\n"
+    "#STRIP_SEMAPHORES=1\n"
+    "#\n"
     "# DIAGNOSTIC: after every GPU submit, wait until the GPU has finished it. The log then shows\n"
     "# exactly which submit kills the GPU (1 = wait on that queue, 2 = wait on the whole device).\n"
     "#SERIALIZE_SUBMITS=1\n"
@@ -1234,6 +1327,12 @@ void loadEnvConfig() {
     if (k == "SERIALIZE_SUBMITS") {
       g_serialize = atoi(v.c_str());
       logf("settings: SERIALIZE_SUBMITS=%d", g_serialize);
+    } else if (k == "DEDUP_WAITS") {
+      g_dedup = atoi(v.c_str());
+      logf("settings: DEDUP_WAITS=%d", g_dedup);
+    } else if (k == "STRIP_SEMAPHORES") {
+      g_strip = atoi(v.c_str());
+      logf("settings: STRIP_SEMAPHORES=%d", g_strip);
     } else if (k == "CLAMP_QUEUES") {
       g_clamp = atoi(v.c_str());
       logf("settings: CLAMP_QUEUES=%d", g_clamp);
@@ -1288,7 +1387,7 @@ void lazyInit() {
 __attribute__((constructor)) void shimInit() {
   initPaths();
   installCrashHandlers();
-  logf("vkshim build: v5-diag (CLAMP_QUEUES, ACQUIRE_LAUNDER, SERIALIZE_SUBMITS, queue/semaphore detail, logs in Android/media)");
+  logf("vkshim build: v6-diag (DEDUP_WAITS, STRIP_SEMAPHORES, CLAMP_QUEUES, ACQUIRE_LAUNDER, SERIALIZE_SUBMITS, logs in Android/media)");
   environmentReport();
   {  // safety net: normally libdatalink.so (loaded from Java) already did this; running again is a no-op
     datalink::Ctx dc;
