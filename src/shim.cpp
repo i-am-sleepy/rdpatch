@@ -26,6 +26,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <map>
 #include <mutex>
 #include <set>
 #include <string>
@@ -86,6 +87,10 @@ void logf(const char* fmt, ...) {
   __android_log_write(ANDROID_LOG_INFO, "vkshim", body);
 }
 
+int g_clamp = 0;       // CLAMP_QUEUES: give the game only as many queues as the driver advertises (shared + locked)
+int g_launder = 0;     // ACQUIRE_LAUNDER: re-signal acquire semaphores through a normal GPU submit
+std::mutex g_qlock;    // serialises queue use when CLAMP_QUEUES / ACQUIRE_LAUNDER are on
+std::map<uint32_t, uint32_t> g_famAdv;  // family -> number of queues the driver really offers (only filled when clamping)
 int g_serialize = 0;   // SERIALIZE_SUBMITS: 1 = wait for the queue after every submit, 2 = wait for the whole device
 bool g_verbose = false;  // VKSHIM_VERBOSE=1 in tu_env.txt: every traced call also goes to the log file
 
@@ -554,6 +559,16 @@ std::string qname(VkQueue q) {
   for (auto& e : g_queues) if (e.q == q) return e.name;
   return "q?";
 }
+struct QLock {  // held while the game uses a queue, only when a setting that merges/reorders queue use is active
+  std::unique_lock<std::mutex> lk;
+  QLock() : lk(g_qlock, std::defer_lock) { if (g_clamp || g_launder) lk.lock(); }
+};
+std::string semList(const VkSemaphore* s, uint32_t n) {
+  std::string o = "[";
+  for (uint32_t i = 0; s && i < n && i < 4; i++) { char b[32]; snprintf(b, sizeof b, "%s%p", i ? "," : "", (void*)s[i]); o += b; }
+  if (n > 4) o += ",...";
+  return o + "]";
+}
 
 VKAPI_ATTR VkResult VKAPI_CALL h_EnumerateDeviceExtensionProperties(VkPhysicalDevice pd, const char* layer, uint32_t* pCount,
                                                                     VkExtensionProperties* pProps) {
@@ -587,6 +602,7 @@ VKAPI_ATTR VkResult VKAPI_CALL h_CreateDevice(VkPhysicalDevice pd, const VkDevic
   if (!r) r = (PFN_vkCreateDevice)resolveInst("vkCreateDevice");
   VkDeviceCreateInfo ci2;
   std::vector<const char*> exts;
+  std::vector<VkDeviceQueueCreateInfo> qcs;
   const VkDeviceCreateInfo* use = ci;
   if (ci) {
     logf("vkCreateDevice: queues=%u pNext sTypes: %s", ci->queueCreateInfoCount, pnextChain(ci->pNext).c_str());
@@ -598,16 +614,40 @@ VKAPI_ATTR VkResult VKAPI_CALL h_CreateDevice(VkPhysicalDevice pd, const VkDevic
       for (uint32_t j = 0; j < qc.queueCount && j < 8; j++) { char b[16]; snprintf(b, sizeof b, "%.2f ", qc.pQueuePriorities ? qc.pQueuePriorities[j] : 0.f); pr += b; }
       logf("  queue-create[%u]: family=%u queueCount=%u priorities=%s", i, qc.queueFamilyIndex, qc.queueCount, pr.c_str());
     }
+    bool modified = false;
+    ci2 = *ci;
     if (!g_hideExt.empty()) {
       for (uint32_t i = 0; i < ci->enabledExtensionCount; i++) {
         if (g_hideExt.count(ci->ppEnabledExtensionNames[i])) { logf("  (HIDE_EXT) removing %s from vkCreateDevice", ci->ppEnabledExtensionNames[i]); continue; }
         exts.push_back(ci->ppEnabledExtensionNames[i]);
       }
-      ci2 = *ci;
       ci2.enabledExtensionCount = (uint32_t)exts.size();
       ci2.ppEnabledExtensionNames = exts.data();
-      use = &ci2;
+      modified = true;
     }
+    if (g_clamp && ci->queueCreateInfoCount && ci->pQueueCreateInfos) {
+      static PFN_vkGetPhysicalDeviceQueueFamilyProperties qf;
+      if (!qf) qf = (PFN_vkGetPhysicalDeviceQueueFamilyProperties)resolveInst("vkGetPhysicalDeviceQueueFamilyProperties");
+      if (qf) {
+        uint32_t nf = 0;
+        qf(pd, &nf, nullptr);
+        std::vector<VkQueueFamilyProperties> fp(nf);
+        if (nf) qf(pd, &nf, fp.data());
+        qcs.assign(ci->pQueueCreateInfos, ci->pQueueCreateInfos + ci->queueCreateInfoCount);
+        bool clamped = false;
+        for (auto& q : qcs) {
+          if (q.queueFamilyIndex < nf && fp[q.queueFamilyIndex].queueCount > 0 && q.queueCount > fp[q.queueFamilyIndex].queueCount) {
+            logf("CLAMP_QUEUES: family %u: game asked for %u queues, driver offers %u -> creating %u", q.queueFamilyIndex, q.queueCount,
+                 fp[q.queueFamilyIndex].queueCount, fp[q.queueFamilyIndex].queueCount);
+            g_famAdv[q.queueFamilyIndex] = fp[q.queueFamilyIndex].queueCount;
+            q.queueCount = fp[q.queueFamilyIndex].queueCount;
+            clamped = true;
+          }
+        }
+        if (clamped) { ci2.pQueueCreateInfos = qcs.data(); modified = true; }
+      }
+    }
+    if (modified) use = &ci2;
   }
   VkResult res = r ? r(pd, use, a, out) : VK_ERROR_INITIALIZATION_FAILED;
   if (res == VK_SUCCESS && out) g_dev = *out;
@@ -642,25 +682,70 @@ VKAPI_ATTR VkResult VKAPI_CALL h_GetSwapchainImagesKHR(VkDevice d, VkSwapchainKH
   return res;
 }
 
+// ACQUIRE_LAUNDER: waits for the acquire semaphore on the GPU queue and signals it again from a normal submit, so later waits
+// never depend on the window system's native fence. Also logs whether that step itself works.
+void launderSemaphore(VkDevice d, VkSemaphore sem) {
+  static PFN_vkCreateFence cf;
+  static PFN_vkDestroyFence df;
+  static PFN_vkWaitForFences wf;
+  static PFN_vkQueueSubmit qs;
+  if (!cf) cf = devFn<PFN_vkCreateFence>("vkCreateFence");
+  if (!df) df = devFn<PFN_vkDestroyFence>("vkDestroyFence");
+  if (!wf) wf = devFn<PFN_vkWaitForFences>("vkWaitForFences");
+  if (!qs) qs = devFn<PFN_vkQueueSubmit>("vkQueueSubmit");
+  VkQueue q = nullptr;
+  {
+    std::lock_guard<std::mutex> lk(g_qm);
+    if (!g_queues.empty()) q = g_queues[0].q;
+  }
+  if (!cf || !df || !wf || !qs || !q) return;
+  VkFenceCreateInfo fci;
+  memset(&fci, 0, sizeof fci);
+  fci.sType = (VkStructureType)8;  // VK_STRUCTURE_TYPE_FENCE_CREATE_INFO
+  VkFence f = VK_NULL_HANDLE;
+  if (cf(d, &fci, nullptr, &f) != VK_SUCCESS) return;
+  VkPipelineStageFlags stage = 0x00010000;  // ALL_COMMANDS
+  VkSubmitInfo si;
+  memset(&si, 0, sizeof si);
+  si.sType = (VkStructureType)4;  // VK_STRUCTURE_TYPE_SUBMIT_INFO
+  si.waitSemaphoreCount = 1;
+  si.pWaitSemaphores = &sem;
+  si.pWaitDstStageMask = &stage;
+  si.signalSemaphoreCount = 1;
+  si.pSignalSemaphores = &sem;
+  VkResult r1, r2;
+  {
+    QLock ql;
+    r1 = qs(q, 1, &si, f);
+  }
+  r2 = r1 == VK_SUCCESS ? wf(d, 1, &f, 1, 2000000000ull) : r1;
+  df(d, f, nullptr);
+  static std::atomic<int> k{0};
+  if (k.fetch_add(1) < 6 || r2 != VK_SUCCESS)
+    logf("ACQUIRE_LAUNDER: re-signal submit -> %s, wait -> %s", vkres((int)r1), vkres((int)r2));
+  note("acquire-launder", r2);
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL h_AcquireNextImageKHR(VkDevice d, VkSwapchainKHR sc, uint64_t timeout, VkSemaphore sem, VkFence fence,
                                                      uint32_t* idx) {
   static PFN_vkAcquireNextImageKHR r;
   if (!r) r = devFn<PFN_vkAcquireNextImageKHR>("vkAcquireNextImageKHR");
   VkResult res = r ? r(d, sc, timeout, sem, fence, idx) : VK_ERROR_INITIALIZATION_FAILED;
   long n = ++g_nAcquire;
-  tracef("acquire#%ld sc=%p -> %s idx=%u", n, (void*)sc, vkres((int)res), idx ? *idx : 0u);
-  if (n <= 3) logf("vkAcquireNextImageKHR #%ld -> %s idx=%u", n, vkres((int)res), idx ? *idx : 0u);
+  tracef("acquire#%ld sc=%p sem=%p fence=%p -> %s idx=%u", n, (void*)sc, (void*)sem, (void*)fence, vkres((int)res), idx ? *idx : 0u);
+  if (n <= 4) logf("vkAcquireNextImageKHR #%ld -> %s idx=%u sem=%p fence=%p", n, vkres((int)res), idx ? *idx : 0u, (void*)sem, (void*)fence);
   note("vkAcquireNextImageKHR", res);
+  if (g_launder && sem != VK_NULL_HANDLE && (res == VK_SUCCESS || res == VK_SUBOPTIMAL_KHR)) launderSemaphore(d, sem);
   return res;
 }
-
 VKAPI_ATTR VkResult VKAPI_CALL h_QueuePresentKHR(VkQueue q, const VkPresentInfoKHR* pi) {
   static PFN_vkQueuePresentKHR r;
   if (!r) r = devFn<PFN_vkQueuePresentKHR>("vkQueuePresentKHR");
+  QLock ql;
   VkResult res = r ? r(q, pi) : VK_ERROR_INITIALIZATION_FAILED;
   long n = ++g_nPresent;
-  tracef("present#%ld queue=%s waitSems=%u swapchains=%u -> %s", n, qname(q).c_str(), pi ? pi->waitSemaphoreCount : 0u, pi ? pi->swapchainCount : 0u, vkres((int)res));
-  if (n <= 3) logf("vkQueuePresentKHR #%ld -> %s (pNext sTypes: %s)", n, vkres((int)res), pi ? pnextChain(pi->pNext).c_str() : "");
+  tracef("present#%ld queue=%s waitSems=%s swapchains=%u -> %s", n, qname(q).c_str(), pi ? semList(pi->pWaitSemaphores, pi->waitSemaphoreCount).c_str() : "[]", pi ? pi->swapchainCount : 0u, vkres((int)res));
+  if (n <= 4) logf("vkQueuePresentKHR #%ld queue=%s waitSems=%s -> %s (pNext sTypes: %s)", n, qname(q).c_str(), pi ? semList(pi->pWaitSemaphores, pi->waitSemaphoreCount).c_str() : "[]", vkres((int)res), pi ? pnextChain(pi->pNext).c_str() : "");
   if (pi && pi->pResults)
     for (uint32_t i = 0; i < pi->swapchainCount; i++) note("vkQueuePresentKHR(per-swapchain)", pi->pResults[i]);
   note("vkQueuePresentKHR", res);
@@ -670,7 +755,12 @@ VKAPI_ATTR VkResult VKAPI_CALL h_QueuePresentKHR(VkQueue q, const VkPresentInfoK
 VKAPI_ATTR void VKAPI_CALL h_GetDeviceQueue(VkDevice d, uint32_t fam, uint32_t idx, VkQueue* out) {
   static PFN_vkGetDeviceQueue r;
   if (!r) r = devFn<PFN_vkGetDeviceQueue>("vkGetDeviceQueue");
-  if (r) r(d, fam, idx, out);
+  uint32_t ridx = idx;
+  if (g_clamp) {
+    auto it = g_famAdv.find(fam);
+    if (it != g_famAdv.end() && idx >= it->second) ridx = 0;
+  }
+  if (r) r(d, fam, ridx, out);
   VkQueue q = out ? *out : nullptr;
   char nm[32];
   snprintf(nm, sizeof nm, "f%u/i%u", fam, idx);
@@ -681,7 +771,7 @@ VKAPI_ATTR void VKAPI_CALL h_GetDeviceQueue(VkDevice d, uint32_t fam, uint32_t i
       if (e.q == q) { if (e.name.find(nm) == std::string::npos) e.name += std::string("+") + nm; found = true; }
     if (!found) g_queues.push_back({q, nm});
   }
-  logf("vkGetDeviceQueue(family=%u, index=%u) -> queue %p", fam, idx, (void*)q);
+  logf("vkGetDeviceQueue(family=%u, index=%u%s) -> queue %p", fam, idx, ridx != idx ? " [CLAMP: shared with index 0]" : "", (void*)q);
 }
 
 void logQFam(const char* fn, uint32_t i, const VkQueueFamilyProperties& p) {
@@ -758,6 +848,7 @@ VKAPI_ATTR void VKAPI_CALL h_CmdCopyBufferToImage(VkCommandBuffer cb, VkBuffer b
 VKAPI_ATTR VkResult VKAPI_CALL h_QueueSubmit(VkQueue q, uint32_t cnt, const VkSubmitInfo* si, VkFence fence) {
   static PFN_vkQueueSubmit r;
   if (!r) r = devFn<PFN_vkQueueSubmit>("vkQueueSubmit");
+  QLock ql;
   uint32_t cbs = 0, waits = 0, sigs = 0;
   bool hasNext = false;
   for (uint32_t i = 0; si && i < cnt; i++) {
@@ -769,15 +860,17 @@ VKAPI_ATTR VkResult VKAPI_CALL h_QueueSubmit(VkQueue q, uint32_t cnt, const VkSu
   long n = ++g_nSubmit;
   long cRP = g_cRP.exchange(0), cBind = g_cBind.exchange(0), cDraw = g_cDraw.exchange(0), cDisp = g_cDisp.exchange(0), cCopy = g_cCopy.exchange(0);
   std::string qn = qname(q);
+  std::string wl = si && cnt ? semList(si[0].pWaitSemaphores, si[0].waitSemaphoreCount) : "[]";
+  std::string sl = si && cnt ? semList(si[0].pSignalSemaphores, si[0].signalSemaphoreCount) : "[]";
   double t0 = nowSec();
   VkResult res = r ? r(q, cnt, si, fence) : VK_ERROR_INITIALIZATION_FAILED;
   double dt = nowSec() - t0;
   char what[160];
   snprintf(what, sizeof what, "renderpasses=%ld pipelineBinds=%ld draws=%ld dispatches=%ld bufToImageCopies=%ld", cRP, cBind, cDraw, cDisp, cCopy);
-  tracef("submit#%ld queue=%s(%p) batches=%u cmdbufs=%u wait=%u signal=%u%s fence=%p -> %s (%.1f ms) | recorded since last submit: %s",
-         n, qn.c_str(), (void*)q, cnt, cbs, waits, sigs, hasNext ? " +pNext" : "", (void*)fence, vkres((int)res), dt * 1000, what);
+  tracef("submit#%ld queue=%s(%p) batches=%u cmdbufs=%u wait=%s signal=%s%s fence=%p -> %s (%.1f ms) | recorded since last submit: %s",
+         n, qn.c_str(), (void*)q, cnt, cbs, wl.c_str(), sl.c_str(), hasNext ? " +pNext" : "", (void*)fence, vkres((int)res), dt * 1000, what);
   if (n <= 14 || res != VK_SUCCESS)
-    logf("vkQueueSubmit #%ld queue=%s batches=%u cmdbufs=%u wait=%u signal=%u fence=%s -> %s | %s", n, qn.c_str(), cnt, cbs, waits, sigs,
+    logf("vkQueueSubmit #%ld queue=%s batches=%u cmdbufs=%u wait=%s signal=%s fence=%s -> %s | %s", n, qn.c_str(), cnt, cbs, wl.c_str(), sl.c_str(),
          fence ? "yes" : "no", vkres((int)res), what);
   if (dt > 0.25) logf("slow vkQueueSubmit #%ld took %.0f ms", n, dt * 1000);
   note("vkQueueSubmit", res);
@@ -801,6 +894,7 @@ VkResult submit2Impl(const char* name, VkQueue q, uint32_t cnt, const VkSubmitIn
   static PFN_vkQueueSubmit2 r1, r2;
   PFN_vkQueueSubmit2& r = !strcmp(name, "vkQueueSubmit2") ? r1 : r2;
   if (!r) r = devFn<PFN_vkQueueSubmit2>(name);
+  QLock ql;
   long n = ++g_nSubmit;
   double t0 = nowSec();
   VkResult res = r ? r(q, cnt, si, fence) : VK_ERROR_INITIALIZATION_FAILED;
@@ -829,6 +923,7 @@ VKAPI_ATTR VkResult VKAPI_CALL h_WaitForFences(VkDevice d, uint32_t cnt, const V
 VKAPI_ATTR VkResult VKAPI_CALL h_QueueWaitIdle(VkQueue q) {
   static PFN_vkQueueWaitIdle r;
   if (!r) r = devFn<PFN_vkQueueWaitIdle>("vkQueueWaitIdle");
+  QLock ql;
   VkResult res = r ? r(q) : VK_ERROR_INITIALIZATION_FAILED;
   tracef("queueWaitIdle queue=%p -> %s", (void*)q, vkres((int)res));
   note("vkQueueWaitIdle", res);
@@ -1093,6 +1188,13 @@ const char* kEnvTemplate =
     "# library from using VK_GOOGLE_display_timing.\n"
     "#HIDE_EXT=VK_GOOGLE_display_timing\n"
     "#\n"
+    "# FIX ATTEMPT A: the game asks for 2 GPU queues but this driver only offers 1. Give the game 1 queue\n"
+    "# (the game's two queues then share it, with locking).\n"
+    "#CLAMP_QUEUES=1\n"
+    "#\n"
+    "# FIX ATTEMPT B: after every image acquire, re-signal the swapchain semaphore through a normal GPU submit.\n"
+    "#ACQUIRE_LAUNDER=1\n"
+    "#\n"
     "# DIAGNOSTIC: after every GPU submit, wait until the GPU has finished it. The log then shows\n"
     "# exactly which submit kills the GPU (1 = wait on that queue, 2 = wait on the whole device).\n"
     "#SERIALIZE_SUBMITS=1\n"
@@ -1132,6 +1234,12 @@ void loadEnvConfig() {
     if (k == "SERIALIZE_SUBMITS") {
       g_serialize = atoi(v.c_str());
       logf("settings: SERIALIZE_SUBMITS=%d", g_serialize);
+    } else if (k == "CLAMP_QUEUES") {
+      g_clamp = atoi(v.c_str());
+      logf("settings: CLAMP_QUEUES=%d", g_clamp);
+    } else if (k == "ACQUIRE_LAUNDER") {
+      g_launder = atoi(v.c_str());
+      logf("settings: ACQUIRE_LAUNDER=%d", g_launder);
     } else if (k == "HIDE_EXT") {
       size_t q = 0;
       while (q <= v.size()) {
@@ -1180,7 +1288,7 @@ void lazyInit() {
 __attribute__((constructor)) void shimInit() {
   initPaths();
   installCrashHandlers();
-  logf("vkshim build: v4-diag (logs in Android/media, queue + submit detail, command counters, SERIALIZE_SUBMITS)");
+  logf("vkshim build: v5-diag (CLAMP_QUEUES, ACQUIRE_LAUNDER, SERIALIZE_SUBMITS, queue/semaphore detail, logs in Android/media)");
   environmentReport();
   {  // safety net: normally libdatalink.so (loaded from Java) already did this; running again is a no-op
     datalink::Ctx dc;
