@@ -86,6 +86,7 @@ void logf(const char* fmt, ...) {
   __android_log_write(ANDROID_LOG_INFO, "vkshim", body);
 }
 
+int g_serialize = 0;   // SERIALIZE_SUBMITS: 1 = wait for the queue after every submit, 2 = wait for the whole device
 bool g_verbose = false;  // VKSHIM_VERBOSE=1 in tu_env.txt: every traced call also goes to the log file
 
 // like logf, but normally only goes into the in-memory ring (so it shows up in crash_*.txt) - cheap enough for per-frame calls
@@ -178,11 +179,14 @@ void initPaths() {
   if (fd >= 0) { (void)!read(fd, cl, sizeof cl - 1); close(fd); }
   g_pkg = cl;
   if (g_pkg.empty()) g_pkg = "com.rockstargames.rdr";
-  const char* ext[] = {"/storage/emulated/0/Android/data/", "/sdcard/Android/data/", nullptr};
+  // Android/media/<package> first (easy to reach with any file manager), Android/data as a fallback
+  const char* ext[] = {"/storage/emulated/0/Android/media/", "/sdcard/Android/media/",
+                       "/storage/emulated/0/Android/data/", "/sdcard/Android/data/", nullptr};
   for (int i = 0; ext[i]; i++) {
-    std::string d = std::string(ext[i]) + g_pkg + "/files/vkshim_logs";
+    bool media = strstr(ext[i], "/media/") != nullptr;
+    std::string d = std::string(ext[i]) + g_pkg + (media ? "/vkshim_logs" : "/files/vkshim_logs");
     mkdirs(d);
-    if (exists(d)) { g_logdir = d; break; }
+    if (exists(d) && access(d.c_str(), W_OK) == 0) { g_logdir = d; break; }
   }
   const char* in[] = {"/data/user/0/", "/data/data/", nullptr};
   for (int i = 0; in[i]; i++) {
@@ -353,6 +357,7 @@ VkDevice g_dev = VK_NULL_HANDLE;
 std::set<std::string> g_hideExt;       // HIDE_EXT=... in tu_env.txt
 std::atomic<bool> g_lost{false};       // set when the first VK_ERROR_DEVICE_LOST is seen
 std::atomic<long> g_nSubmit{0}, g_nPresent{0}, g_nAcquire{0}, g_nPipe{0}, g_nShader{0};
+std::atomic<long> g_cDraw{0}, g_cBind{0}, g_cRP{0}, g_cDisp{0}, g_cCopy{0};  // command counts since the last submit
 std::mutex g_nullm;
 std::set<std::string> g_nullSeen;
 
@@ -541,6 +546,15 @@ F devFn(const char* name) {
   return (F)p;
 }
 
+struct QEntry { VkQueue q; std::string name; };
+std::vector<QEntry> g_queues;
+std::mutex g_qm;
+std::string qname(VkQueue q) {
+  std::lock_guard<std::mutex> lk(g_qm);
+  for (auto& e : g_queues) if (e.q == q) return e.name;
+  return "q?";
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL h_EnumerateDeviceExtensionProperties(VkPhysicalDevice pd, const char* layer, uint32_t* pCount,
                                                                     VkExtensionProperties* pProps) {
   static PFN_vkEnumerateDeviceExtensionProperties r;
@@ -578,6 +592,12 @@ VKAPI_ATTR VkResult VKAPI_CALL h_CreateDevice(VkPhysicalDevice pd, const VkDevic
     logf("vkCreateDevice: queues=%u pNext sTypes: %s", ci->queueCreateInfoCount, pnextChain(ci->pNext).c_str());
     for (uint32_t i = 0; i < ci->enabledExtensionCount; i++) logf("  dev-ext[%u]=%s", i, ci->ppEnabledExtensionNames[i]);
     logDeviceFeatures(ci);
+    for (uint32_t i = 0; i < ci->queueCreateInfoCount; i++) {
+      const VkDeviceQueueCreateInfo& qc = ci->pQueueCreateInfos[i];
+      std::string pr;
+      for (uint32_t j = 0; j < qc.queueCount && j < 8; j++) { char b[16]; snprintf(b, sizeof b, "%.2f ", qc.pQueuePriorities ? qc.pQueuePriorities[j] : 0.f); pr += b; }
+      logf("  queue-create[%u]: family=%u queueCount=%u priorities=%s", i, qc.queueFamilyIndex, qc.queueCount, pr.c_str());
+    }
     if (!g_hideExt.empty()) {
       for (uint32_t i = 0; i < ci->enabledExtensionCount; i++) {
         if (g_hideExt.count(ci->ppEnabledExtensionNames[i])) { logf("  (HIDE_EXT) removing %s from vkCreateDevice", ci->ppEnabledExtensionNames[i]); continue; }
@@ -639,7 +659,7 @@ VKAPI_ATTR VkResult VKAPI_CALL h_QueuePresentKHR(VkQueue q, const VkPresentInfoK
   if (!r) r = devFn<PFN_vkQueuePresentKHR>("vkQueuePresentKHR");
   VkResult res = r ? r(q, pi) : VK_ERROR_INITIALIZATION_FAILED;
   long n = ++g_nPresent;
-  tracef("present#%ld waitSems=%u swapchains=%u -> %s", n, pi ? pi->waitSemaphoreCount : 0u, pi ? pi->swapchainCount : 0u, vkres((int)res));
+  tracef("present#%ld queue=%s waitSems=%u swapchains=%u -> %s", n, qname(q).c_str(), pi ? pi->waitSemaphoreCount : 0u, pi ? pi->swapchainCount : 0u, vkres((int)res));
   if (n <= 3) logf("vkQueuePresentKHR #%ld -> %s (pNext sTypes: %s)", n, vkres((int)res), pi ? pnextChain(pi->pNext).c_str() : "");
   if (pi && pi->pResults)
     for (uint32_t i = 0; i < pi->swapchainCount; i++) note("vkQueuePresentKHR(per-swapchain)", pi->pResults[i]);
@@ -647,19 +667,133 @@ VKAPI_ATTR VkResult VKAPI_CALL h_QueuePresentKHR(VkQueue q, const VkPresentInfoK
   return res;
 }
 
+VKAPI_ATTR void VKAPI_CALL h_GetDeviceQueue(VkDevice d, uint32_t fam, uint32_t idx, VkQueue* out) {
+  static PFN_vkGetDeviceQueue r;
+  if (!r) r = devFn<PFN_vkGetDeviceQueue>("vkGetDeviceQueue");
+  if (r) r(d, fam, idx, out);
+  VkQueue q = out ? *out : nullptr;
+  char nm[32];
+  snprintf(nm, sizeof nm, "f%u/i%u", fam, idx);
+  {
+    std::lock_guard<std::mutex> lk(g_qm);
+    bool found = false;
+    for (auto& e : g_queues)
+      if (e.q == q) { if (e.name.find(nm) == std::string::npos) e.name += std::string("+") + nm; found = true; }
+    if (!found) g_queues.push_back({q, nm});
+  }
+  logf("vkGetDeviceQueue(family=%u, index=%u) -> queue %p", fam, idx, (void*)q);
+}
+
+void logQFam(const char* fn, uint32_t i, const VkQueueFamilyProperties& p) {
+  logf("  %s family[%u]: flags=0x%x queueCount=%u timestampValidBits=%u", fn, i, (unsigned)p.queueFlags, p.queueCount, p.timestampValidBits);
+}
+VKAPI_ATTR void VKAPI_CALL h_GetPhysicalDeviceQueueFamilyProperties(VkPhysicalDevice pd, uint32_t* n, VkQueueFamilyProperties* props) {
+  static PFN_vkGetPhysicalDeviceQueueFamilyProperties r;
+  if (!r) r = (PFN_vkGetPhysicalDeviceQueueFamilyProperties)resolveInst("vkGetPhysicalDeviceQueueFamilyProperties");
+  if (r) r(pd, n, props);
+  static std::atomic<int> k{0};
+  if (n && props && k.fetch_add(1) < 4) for (uint32_t i = 0; i < *n; i++) logQFam("vkGetPhysicalDeviceQueueFamilyProperties", i, props[i]);
+}
+void qfam2Impl(const char* name, VkPhysicalDevice pd, uint32_t* n, VkQueueFamilyProperties2* props) {
+  static PFN_vkGetPhysicalDeviceQueueFamilyProperties2 r1, r2;
+  PFN_vkGetPhysicalDeviceQueueFamilyProperties2& r = !strcmp(name, "vkGetPhysicalDeviceQueueFamilyProperties2") ? r1 : r2;
+  if (!r) r = (PFN_vkGetPhysicalDeviceQueueFamilyProperties2)resolveInst(name);
+  if (r) r(pd, n, props);
+  static std::atomic<int> k{0};
+  if (n && props && k.fetch_add(1) < 4) for (uint32_t i = 0; i < *n; i++) logQFam(name, i, props[i].queueFamilyProperties);
+}
+VKAPI_ATTR void VKAPI_CALL h_GetPhysicalDeviceQueueFamilyProperties2(VkPhysicalDevice pd, uint32_t* n, VkQueueFamilyProperties2* p) { qfam2Impl("vkGetPhysicalDeviceQueueFamilyProperties2", pd, n, p); }
+VKAPI_ATTR void VKAPI_CALL h_GetPhysicalDeviceQueueFamilyProperties2KHR(VkPhysicalDevice pd, uint32_t* n, VkQueueFamilyProperties2* p) { qfam2Impl("vkGetPhysicalDeviceQueueFamilyProperties2KHR", pd, n, p); }
+
+// ---- command counters (cheap; reported at every submit so the log shows what kind of work was handed to the GPU)
+VKAPI_ATTR void VKAPI_CALL h_CmdDraw(VkCommandBuffer cb, uint32_t a, uint32_t b, uint32_t c, uint32_t d) {
+  static PFN_vkCmdDraw r;
+  if (!r) r = devFn<PFN_vkCmdDraw>("vkCmdDraw");
+  g_cDraw.fetch_add(1, std::memory_order_relaxed);
+  if (r) r(cb, a, b, c, d);
+}
+VKAPI_ATTR void VKAPI_CALL h_CmdDrawIndexed(VkCommandBuffer cb, uint32_t a, uint32_t b, uint32_t c, int32_t d, uint32_t e) {
+  static PFN_vkCmdDrawIndexed r;
+  if (!r) r = devFn<PFN_vkCmdDrawIndexed>("vkCmdDrawIndexed");
+  g_cDraw.fetch_add(1, std::memory_order_relaxed);
+  if (r) r(cb, a, b, c, d, e);
+}
+VKAPI_ATTR void VKAPI_CALL h_CmdBindPipeline(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipeline pl) {
+  static PFN_vkCmdBindPipeline r;
+  if (!r) r = devFn<PFN_vkCmdBindPipeline>("vkCmdBindPipeline");
+  g_cBind.fetch_add(1, std::memory_order_relaxed);
+  if (r) r(cb, bp, pl);
+}
+VKAPI_ATTR void VKAPI_CALL h_CmdBeginRenderPass(VkCommandBuffer cb, const VkRenderPassBeginInfo* bi, VkSubpassContents sc) {
+  static PFN_vkCmdBeginRenderPass r;
+  if (!r) r = devFn<PFN_vkCmdBeginRenderPass>("vkCmdBeginRenderPass");
+  g_cRP.fetch_add(1, std::memory_order_relaxed);
+  if (r) r(cb, bi, sc);
+}
+VKAPI_ATTR void VKAPI_CALL h_CmdBeginRenderPass2(VkCommandBuffer cb, const VkRenderPassBeginInfo* bi, const VkSubpassBeginInfo* sb) {
+  static PFN_vkCmdBeginRenderPass2 r;
+  if (!r) r = devFn<PFN_vkCmdBeginRenderPass2>("vkCmdBeginRenderPass2");
+  g_cRP.fetch_add(1, std::memory_order_relaxed);
+  if (r) r(cb, bi, sb);
+}
+VKAPI_ATTR void VKAPI_CALL h_CmdBeginRenderPass2KHR(VkCommandBuffer cb, const VkRenderPassBeginInfo* bi, const VkSubpassBeginInfo* sb) {
+  static PFN_vkCmdBeginRenderPass2 r;
+  if (!r) r = devFn<PFN_vkCmdBeginRenderPass2>("vkCmdBeginRenderPass2KHR");
+  g_cRP.fetch_add(1, std::memory_order_relaxed);
+  if (r) r(cb, bi, sb);
+}
+VKAPI_ATTR void VKAPI_CALL h_CmdDispatch(VkCommandBuffer cb, uint32_t x, uint32_t y, uint32_t z) {
+  static PFN_vkCmdDispatch r;
+  if (!r) r = devFn<PFN_vkCmdDispatch>("vkCmdDispatch");
+  g_cDisp.fetch_add(1, std::memory_order_relaxed);
+  if (r) r(cb, x, y, z);
+}
+VKAPI_ATTR void VKAPI_CALL h_CmdCopyBufferToImage(VkCommandBuffer cb, VkBuffer b, VkImage i, VkImageLayout l, uint32_t n, const VkBufferImageCopy* rg) {
+  static PFN_vkCmdCopyBufferToImage r;
+  if (!r) r = devFn<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage");
+  g_cCopy.fetch_add(1, std::memory_order_relaxed);
+  if (r) r(cb, b, i, l, n, rg);
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL h_QueueSubmit(VkQueue q, uint32_t cnt, const VkSubmitInfo* si, VkFence fence) {
   static PFN_vkQueueSubmit r;
   if (!r) r = devFn<PFN_vkQueueSubmit>("vkQueueSubmit");
-  uint32_t cbs = 0;
-  for (uint32_t i = 0; si && i < cnt; i++) cbs += si[i].commandBufferCount;
+  uint32_t cbs = 0, waits = 0, sigs = 0;
+  bool hasNext = false;
+  for (uint32_t i = 0; si && i < cnt; i++) {
+    cbs += si[i].commandBufferCount;
+    waits += si[i].waitSemaphoreCount;
+    sigs += si[i].signalSemaphoreCount;
+    if (si[i].pNext) hasNext = true;
+  }
   long n = ++g_nSubmit;
+  long cRP = g_cRP.exchange(0), cBind = g_cBind.exchange(0), cDraw = g_cDraw.exchange(0), cDisp = g_cDisp.exchange(0), cCopy = g_cCopy.exchange(0);
+  std::string qn = qname(q);
   double t0 = nowSec();
   VkResult res = r ? r(q, cnt, si, fence) : VK_ERROR_INITIALIZATION_FAILED;
   double dt = nowSec() - t0;
-  tracef("submit#%ld queue=%p batches=%u cmdbufs=%u fence=%p -> %s (%.1f ms)", n, (void*)q, cnt, cbs, (void*)fence, vkres((int)res), dt * 1000);
-  if (n <= 3) logf("vkQueueSubmit #%ld batches=%u cmdbufs=%u -> %s", n, cnt, cbs, vkres((int)res));
+  char what[160];
+  snprintf(what, sizeof what, "renderpasses=%ld pipelineBinds=%ld draws=%ld dispatches=%ld bufToImageCopies=%ld", cRP, cBind, cDraw, cDisp, cCopy);
+  tracef("submit#%ld queue=%s(%p) batches=%u cmdbufs=%u wait=%u signal=%u%s fence=%p -> %s (%.1f ms) | recorded since last submit: %s",
+         n, qn.c_str(), (void*)q, cnt, cbs, waits, sigs, hasNext ? " +pNext" : "", (void*)fence, vkres((int)res), dt * 1000, what);
+  if (n <= 14 || res != VK_SUCCESS)
+    logf("vkQueueSubmit #%ld queue=%s batches=%u cmdbufs=%u wait=%u signal=%u fence=%s -> %s | %s", n, qn.c_str(), cnt, cbs, waits, sigs,
+         fence ? "yes" : "no", vkres((int)res), what);
   if (dt > 0.25) logf("slow vkQueueSubmit #%ld took %.0f ms", n, dt * 1000);
   note("vkQueueSubmit", res);
+  if (res == VK_SUCCESS && g_serialize > 0) {
+    static PFN_vkQueueWaitIdle wi;
+    static PFN_vkDeviceWaitIdle dw;
+    if (!wi) wi = devFn<PFN_vkQueueWaitIdle>("vkQueueWaitIdle");
+    if (!dw) dw = devFn<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle");
+    double w0 = nowSec();
+    VkResult wr = (g_serialize >= 2 && dw) ? dw(g_dev) : (wi ? wi(q) : VK_SUCCESS);
+    double wd = nowSec() - w0;
+    tracef("serialize: GPU finished submit#%ld on %s -> %s (%.1f ms)", n, qn.c_str(), vkres((int)wr), wd * 1000);
+    if (n <= 40 || wr != VK_SUCCESS)
+      logf("SERIALIZE: waited for GPU after submit #%ld (%s) -> %s in %.1f ms | %s", n, qn.c_str(), vkres((int)wr), wd * 1000, what);
+    note("wait-after-submit", wr);
+  }
   return res;
 }
 
@@ -781,6 +915,18 @@ void* hookFor(const char* n) {
   if (!strcmp(n, "vkCreateComputePipelines")) return (void*)h_CreateComputePipelines;
   if (!strcmp(n, "vkCreateShaderModule")) return (void*)h_CreateShaderModule;
   if (!strcmp(n, "vkAllocateMemory")) return (void*)h_AllocateMemory;
+  if (!strcmp(n, "vkGetDeviceQueue")) return (void*)h_GetDeviceQueue;
+  if (!strcmp(n, "vkGetPhysicalDeviceQueueFamilyProperties")) return (void*)h_GetPhysicalDeviceQueueFamilyProperties;
+  if (!strcmp(n, "vkGetPhysicalDeviceQueueFamilyProperties2")) return (void*)h_GetPhysicalDeviceQueueFamilyProperties2;
+  if (!strcmp(n, "vkGetPhysicalDeviceQueueFamilyProperties2KHR")) return (void*)h_GetPhysicalDeviceQueueFamilyProperties2KHR;
+  if (!strcmp(n, "vkCmdDraw")) return (void*)h_CmdDraw;
+  if (!strcmp(n, "vkCmdDrawIndexed")) return (void*)h_CmdDrawIndexed;
+  if (!strcmp(n, "vkCmdBindPipeline")) return (void*)h_CmdBindPipeline;
+  if (!strcmp(n, "vkCmdBeginRenderPass")) return (void*)h_CmdBeginRenderPass;
+  if (!strcmp(n, "vkCmdBeginRenderPass2")) return (void*)h_CmdBeginRenderPass2;
+  if (!strcmp(n, "vkCmdBeginRenderPass2KHR")) return (void*)h_CmdBeginRenderPass2KHR;
+  if (!strcmp(n, "vkCmdDispatch")) return (void*)h_CmdDispatch;
+  if (!strcmp(n, "vkCmdCopyBufferToImage")) return (void*)h_CmdCopyBufferToImage;
   return nullptr;
 }
 
@@ -925,7 +1071,9 @@ void selfTest() {
 
 // ------------------------------------------------------------------ tu_env.txt (editable settings, no rebuild needed)
 const char* kEnvTemplate =
-    "# vkshim settings. One KEY=VALUE per line. Lines starting with # are ignored.\n"
+    "# vkshim settings (this file lives in Android/media/<package>/vkshim_logs/).\n"
+    "# One KEY=VALUE per line. Lines starting with # are ignored.\n"
+    "# Use only ONE TU_DEBUG line at a time - if there are several, the last one wins.\n"
     "# Changes take effect the next time the game starts - no rebuild needed.\n"
     "# Try ONE experiment at a time: remove the # in front of one line, start the game,\n"
     "# then look at vkshim.log. Flag names come from the Mesa Turnip driver; unknown ones are ignored.\n"
@@ -944,6 +1092,10 @@ const char* kEnvTemplate =
     "# Hide device extensions from the game (comma separated). Example: stops the game's frame-pacing\n"
     "# library from using VK_GOOGLE_display_timing.\n"
     "#HIDE_EXT=VK_GOOGLE_display_timing\n"
+    "#\n"
+    "# DIAGNOSTIC: after every GPU submit, wait until the GPU has finished it. The log then shows\n"
+    "# exactly which submit kills the GPU (1 = wait on that queue, 2 = wait on the whole device).\n"
+    "#SERIALIZE_SUBMITS=1\n"
     "#\n"
     "# Write every submit/present/acquire call to vkshim.log (big log, only for deep debugging)\n"
     "#VKSHIM_VERBOSE=1\n";
@@ -965,6 +1117,7 @@ void loadEnvConfig() {
   std::string txt = readSmall(path.c_str(), 1 << 16);
   if (txt.rfind("<open failed", 0) == 0) { logf("settings file %s not readable: %s", path.c_str(), txt.c_str()); return; }
   int applied = 0;
+  std::set<std::string> seenKeys;
   size_t pos = 0;
   while (pos <= txt.size()) {
     size_t nl = txt.find('\n', pos);
@@ -975,7 +1128,11 @@ void loadEnvConfig() {
     if (eq == std::string::npos) { logf("settings: ignoring line without '=': %s", line.c_str()); continue; }
     std::string k = trimStr(line.substr(0, eq)), v = trimStr(line.substr(eq + 1));
     if (k.empty()) continue;
-    if (k == "HIDE_EXT") {
+    if (!seenKeys.insert(k).second) logf("settings: WARNING %s appears more than once - the LAST one wins", k.c_str());
+    if (k == "SERIALIZE_SUBMITS") {
+      g_serialize = atoi(v.c_str());
+      logf("settings: SERIALIZE_SUBMITS=%d", g_serialize);
+    } else if (k == "HIDE_EXT") {
       size_t q = 0;
       while (q <= v.size()) {
         size_t c = v.find(',', q);
@@ -1023,7 +1180,7 @@ void lazyInit() {
 __attribute__((constructor)) void shimInit() {
   initPaths();
   installCrashHandlers();
-  logf("vkshim build: v3-diag (swapchain/submit/present/pipeline result logging, tu_env.txt settings)");
+  logf("vkshim build: v4-diag (logs in Android/media, queue + submit detail, command counters, SERIALIZE_SUBMITS)");
   environmentReport();
   {  // safety net: normally libdatalink.so (loaded from Java) already did this; running again is a no-op
     datalink::Ctx dc;
