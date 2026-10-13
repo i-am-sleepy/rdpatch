@@ -24,9 +24,12 @@
 #include <unistd.h>
 #include <unwind.h>
 
+#include <algorithm>
+#include <atomic>
 #include <mutex>
 #include <set>
 #include <string>
+#include <vector>
 
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan.h>
@@ -35,6 +38,7 @@
 #define HID __attribute__((visibility("hidden")))
 #define EXP __attribute__((visibility("default")))
 
+#include "datalink.h"
 #include "names.inc"
 
 extern "C" {
@@ -80,6 +84,38 @@ void logf(const char* fmt, ...) {
     fsync(g_fd);  // survive hard kills
   }
   __android_log_write(ANDROID_LOG_INFO, "vkshim", body);
+}
+
+bool g_verbose = false;  // VKSHIM_VERBOSE=1 in tu_env.txt: every traced call also goes to the log file
+
+// like logf, but normally only goes into the in-memory ring (so it shows up in crash_*.txt) - cheap enough for per-frame calls
+void tracef(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
+void tracef(const char* fmt, ...) {
+  char body[512];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(body, sizeof body, fmt, ap);
+  va_end(ap);
+  char line[640];
+  int n = snprintf(line, sizeof line, "[%10.3f][p%d t%d] %s\n", nowSec(), getpid(), (int)gettid(), body);
+  if (n <= 0) return;
+  if (n > (int)sizeof line - 1) n = sizeof line - 1;
+  std::lock_guard<std::mutex> lk(g_logm);
+  strncpy(g_ring[g_ringPos % kRing], line, 319);
+  g_ring[g_ringPos % kRing][319] = 0;
+  g_ringPos++;
+  if (g_verbose && g_fd >= 0) (void)!write(g_fd, line, n);
+}
+
+// writes the newest n ring lines to the log file (used when the GPU is first reported lost)
+void dumpRecent(int n) {
+  std::lock_guard<std::mutex> lk(g_logm);
+  if (g_fd < 0) return;
+  int start = g_ringPos > n ? g_ringPos - n : 0;
+  dprintf(g_fd, "---- last %d events before this point ----\n", g_ringPos - start);
+  for (int i = start; i < g_ringPos; i++) dprintf(g_fd, "%s", g_ring[i % kRing]);
+  dprintf(g_fd, "---- end of events ----\n");
+  fsync(g_fd);
 }
 
 void mkdirs(const std::string& p) {
@@ -313,6 +349,10 @@ void environmentReport() {
 PFN_vkGetInstanceProcAddr real_gipa;
 PFN_vkGetDeviceProcAddr real_gdpa;
 VkInstance g_inst = VK_NULL_HANDLE;
+VkDevice g_dev = VK_NULL_HANDLE;
+std::set<std::string> g_hideExt;       // HIDE_EXT=... in tu_env.txt
+std::atomic<bool> g_lost{false};       // set when the first VK_ERROR_DEVICE_LOST is seen
+std::atomic<long> g_nSubmit{0}, g_nPresent{0}, g_nAcquire{0}, g_nPipe{0}, g_nShader{0};
 std::mutex g_nullm;
 std::set<std::string> g_nullSeen;
 
@@ -392,16 +432,330 @@ VKAPI_ATTR void VKAPI_CALL h_GetPhysicalDeviceProperties2(VkPhysicalDevice pd, V
          verStr(p->properties.apiVersion, b), pnextChain(p->pNext).c_str());
   }
 }
+const char* const kCoreFeat[55] = {
+    "robustBufferAccess", "fullDrawIndexUint32", "imageCubeArray", "independentBlend", "geometryShader",
+    "tessellationShader", "sampleRateShading", "dualSrcBlend", "logicOp", "multiDrawIndirect",
+    "drawIndirectFirstInstance", "depthClamp", "depthBiasClamp", "fillModeNonSolid", "depthBounds", "wideLines",
+    "largePoints", "alphaToOne", "multiViewport", "samplerAnisotropy", "textureCompressionETC2",
+    "textureCompressionASTC_LDR", "textureCompressionBC", "occlusionQueryPrecise", "pipelineStatisticsQuery",
+    "vertexPipelineStoresAndAtomics", "fragmentStoresAndAtomics", "shaderTessellationAndGeometryPointSize",
+    "shaderImageGatherExtended", "shaderStorageImageExtendedFormats", "shaderStorageImageMultisample",
+    "shaderStorageImageReadWithoutFormat", "shaderStorageImageWriteWithoutFormat",
+    "shaderUniformBufferArrayDynamicIndexing", "shaderSampledImageArrayDynamicIndexing",
+    "shaderStorageBufferArrayDynamicIndexing", "shaderStorageImageArrayDynamicIndexing", "shaderClipDistance",
+    "shaderCullDistance", "shaderFloat64", "shaderInt64", "shaderInt16", "shaderResourceResidency",
+    "shaderResourceMinLod", "sparseBinding", "sparseResidencyBuffer", "sparseResidencyImage2D",
+    "sparseResidencyImage3D", "sparseResidency2Samples", "sparseResidency4Samples", "sparseResidency8Samples",
+    "sparseResidency16Samples", "sparseResidencyAliased", "variableMultisampleRate", "inheritedQueries"};
+
+const char* const kDescIdxFeat[20] = {
+    "shaderInputAttachmentArrayDynamicIndexing", "shaderUniformTexelBufferArrayDynamicIndexing",
+    "shaderStorageTexelBufferArrayDynamicIndexing", "shaderUniformBufferArrayNonUniformIndexing",
+    "shaderSampledImageArrayNonUniformIndexing", "shaderStorageBufferArrayNonUniformIndexing",
+    "shaderStorageImageArrayNonUniformIndexing", "shaderInputAttachmentArrayNonUniformIndexing",
+    "shaderUniformTexelBufferArrayNonUniformIndexing", "shaderStorageTexelBufferArrayNonUniformIndexing",
+    "descriptorBindingUniformBufferUpdateAfterBind", "descriptorBindingSampledImageUpdateAfterBind",
+    "descriptorBindingStorageImageUpdateAfterBind", "descriptorBindingStorageBufferUpdateAfterBind",
+    "descriptorBindingUniformTexelBufferUpdateAfterBind", "descriptorBindingStorageTexelBufferUpdateAfterBind",
+    "descriptorBindingUpdateUnusedWhilePending", "descriptorBindingPartiallyBound",
+    "descriptorBindingVariableDescriptorCount", "runtimeDescriptorArray"};
+
+void logEnabledBools(const char* what, const VkBool32* b, const char* const* names, int n) {
+  std::string on;
+  for (int i = 0; i < n; i++)
+    if (b[i]) { on += names[i]; on += ' '; }
+  logf("  features[%s] enabled: %s", what, on.empty() ? "(none)" : on.c_str());
+}
+
+void logDeviceFeatures(const VkDeviceCreateInfo* ci) {
+  if (ci->pEnabledFeatures) logEnabledBools("pEnabledFeatures", (const VkBool32*)ci->pEnabledFeatures, kCoreFeat, 55);
+  const void* p = ci->pNext;
+  int guard = 0;
+  while (p && guard++ < 64) {
+    auto b = (const VkBaseInStructure*)p;
+    // the VkBool32 members of every VkPhysicalDevice*Features struct start right after sType/pNext (16 bytes)
+    const VkBool32* f = (const VkBool32*)((const char*)p + sizeof(VkBaseInStructure));
+    switch ((int)b->sType) {
+      case 1000059000: logEnabledBools("Features2", f, kCoreFeat, 55); break;  // VkPhysicalDeviceFeatures2
+      case 1000161001: logEnabledBools("DescriptorIndexing", f, kDescIdxFeat, 20); break;
+      case 1000082000: { static const char* const n[] = {"shaderFloat16", "shaderInt8"}; logEnabledBools("Float16Int8", f, n, 2); break; }
+      case 1000083000: { static const char* const n[] = {"storageBuffer16BitAccess", "uniformAndStorageBuffer16BitAccess", "storagePushConstant16", "storageInputOutput16"}; logEnabledBools("16BitStorage", f, n, 4); break; }
+      case 1000267000: { static const char* const n[] = {"extendedDynamicState"}; logEnabledBools("ExtendedDynamicState", f, n, 1); break; }
+      case 1000261000: { static const char* const n[] = {"hostQueryReset"}; logEnabledBools("HostQueryReset", f, n, 1); break; }
+      case 1000108000: { static const char* const n[] = {"imagelessFramebuffer"}; logEnabledBools("ImagelessFramebuffer", f, n, 1); break; }
+      default: break;
+    }
+    p = b->pNext;
+  }
+}
+
+const char* vkres(int r) {
+  switch (r) {
+    case 0: return "SUCCESS";
+    case 1: return "NOT_READY";
+    case 2: return "TIMEOUT";
+    case 3: return "EVENT_SET";
+    case 4: return "EVENT_RESET";
+    case 5: return "INCOMPLETE";
+    case -1: return "ERROR_OUT_OF_HOST_MEMORY";
+    case -2: return "ERROR_OUT_OF_DEVICE_MEMORY";
+    case -3: return "ERROR_INITIALIZATION_FAILED";
+    case -4: return "ERROR_DEVICE_LOST";
+    case -5: return "ERROR_MEMORY_MAP_FAILED";
+    case -6: return "ERROR_LAYER_NOT_PRESENT";
+    case -7: return "ERROR_EXTENSION_NOT_PRESENT";
+    case -8: return "ERROR_FEATURE_NOT_PRESENT";
+    case -9: return "ERROR_INCOMPATIBLE_DRIVER";
+    case -10: return "ERROR_TOO_MANY_OBJECTS";
+    case -11: return "ERROR_FORMAT_NOT_SUPPORTED";
+    case -12: return "ERROR_FRAGMENTED_POOL";
+    case -13: return "ERROR_UNKNOWN";
+    case -1000069000: return "ERROR_OUT_OF_POOL_MEMORY";
+    case -1000000000: return "ERROR_SURFACE_LOST_KHR";
+    case -1000000001: return "ERROR_NATIVE_WINDOW_IN_USE_KHR";
+    case 1000001003: return "SUBOPTIMAL_KHR";
+    case -1000001004: return "ERROR_OUT_OF_DATE_KHR";
+    default: return "(other)";
+  }
+}
+
+// call after every wrapped call that returns a VkResult
+void note(const char* fn, VkResult r) {
+  if (r == VK_SUCCESS) return;
+  if (r < 0 || r == VK_SUBOPTIMAL_KHR) {
+    static std::atomic<int> logged{0};
+    if (logged.fetch_add(1) < 300) logf("!! %s returned %s (%d)", fn, vkres((int)r), (int)r);
+  }
+  if (r == VK_ERROR_DEVICE_LOST && !g_lost.exchange(true)) {
+    logf("*** FIRST VK_ERROR_DEVICE_LOST (GPU died) reported by %s - submits=%ld presents=%ld acquires=%ld pipelines=%ld shaders=%ld",
+         fn, g_nSubmit.load(), g_nPresent.load(), g_nAcquire.load(), g_nPipe.load(), g_nShader.load());
+    dumpRecent(120);
+  }
+}
+
+template <class F>
+F devFn(const char* name) {
+  PFN_vkVoidFunction p = nullptr;
+  if (real_gdpa && g_dev) p = real_gdpa(g_dev, name);
+  if (!p && real_gipa) p = real_gipa(g_inst, name);
+  return (F)p;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL h_EnumerateDeviceExtensionProperties(VkPhysicalDevice pd, const char* layer, uint32_t* pCount,
+                                                                    VkExtensionProperties* pProps) {
+  static PFN_vkEnumerateDeviceExtensionProperties r;
+  if (!r) r = (PFN_vkEnumerateDeviceExtensionProperties)resolveInst("vkEnumerateDeviceExtensionProperties");
+  if (!r) return VK_ERROR_INITIALIZATION_FAILED;
+  if (g_hideExt.empty()) return r(pd, layer, pCount, pProps);
+  uint32_t n = 0;
+  VkResult res = r(pd, layer, &n, nullptr);
+  if (res != VK_SUCCESS) return res;
+  std::vector<VkExtensionProperties> all(n);
+  res = r(pd, layer, &n, all.data());
+  if (res < 0) return res;
+  all.resize(n);
+  std::vector<VkExtensionProperties> keep;
+  for (auto& e : all) {
+    if (g_hideExt.count(e.extensionName)) { tracef("hiding device extension %s from the game", e.extensionName); continue; }
+    keep.push_back(e);
+  }
+  if (!pProps) { *pCount = (uint32_t)keep.size(); return VK_SUCCESS; }
+  uint32_t m = std::min<uint32_t>(*pCount, (uint32_t)keep.size());
+  if (m) memcpy(pProps, keep.data(), m * sizeof(VkExtensionProperties));
+  VkResult out = m < keep.size() ? VK_INCOMPLETE : VK_SUCCESS;
+  *pCount = m;
+  return out;
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL h_CreateDevice(VkPhysicalDevice pd, const VkDeviceCreateInfo* ci,
                                               const VkAllocationCallbacks* a, VkDevice* out) {
   static PFN_vkCreateDevice r;
   if (!r) r = (PFN_vkCreateDevice)resolveInst("vkCreateDevice");
+  VkDeviceCreateInfo ci2;
+  std::vector<const char*> exts;
+  const VkDeviceCreateInfo* use = ci;
   if (ci) {
     logf("vkCreateDevice: queues=%u pNext sTypes: %s", ci->queueCreateInfoCount, pnextChain(ci->pNext).c_str());
     for (uint32_t i = 0; i < ci->enabledExtensionCount; i++) logf("  dev-ext[%u]=%s", i, ci->ppEnabledExtensionNames[i]);
+    logDeviceFeatures(ci);
+    if (!g_hideExt.empty()) {
+      for (uint32_t i = 0; i < ci->enabledExtensionCount; i++) {
+        if (g_hideExt.count(ci->ppEnabledExtensionNames[i])) { logf("  (HIDE_EXT) removing %s from vkCreateDevice", ci->ppEnabledExtensionNames[i]); continue; }
+        exts.push_back(ci->ppEnabledExtensionNames[i]);
+      }
+      ci2 = *ci;
+      ci2.enabledExtensionCount = (uint32_t)exts.size();
+      ci2.ppEnabledExtensionNames = exts.data();
+      use = &ci2;
+    }
   }
-  VkResult res = r ? r(pd, ci, a, out) : VK_ERROR_INITIALIZATION_FAILED;
+  VkResult res = r ? r(pd, use, a, out) : VK_ERROR_INITIALIZATION_FAILED;
+  if (res == VK_SUCCESS && out) g_dev = *out;
   logf("vkCreateDevice -> res=%d device=%p", (int)res, out ? (void*)*out : nullptr);
+  return res;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL h_CreateSwapchainKHR(VkDevice d, const VkSwapchainCreateInfoKHR* ci, const VkAllocationCallbacks* a,
+                                                    VkSwapchainKHR* out) {
+  static PFN_vkCreateSwapchainKHR r;
+  if (!r) r = devFn<PFN_vkCreateSwapchainKHR>("vkCreateSwapchainKHR");
+  if (ci)
+    logf("vkCreateSwapchainKHR: flags=0x%x minImages=%u format=%d colorSpace=%d extent=%ux%u layers=%u usage=0x%x sharing=%d "
+         "preTransform=0x%x alpha=0x%x presentMode=%d clipped=%u old=%p pNext sTypes: %s",
+         (unsigned)ci->flags, ci->minImageCount, (int)ci->imageFormat, (int)ci->imageColorSpace, ci->imageExtent.width,
+         ci->imageExtent.height, ci->imageArrayLayers, (unsigned)ci->imageUsage, (int)ci->imageSharingMode,
+         (unsigned)ci->preTransform, (unsigned)ci->compositeAlpha, (int)ci->presentMode, (unsigned)ci->clipped,
+         (void*)ci->oldSwapchain, pnextChain(ci->pNext).c_str());
+  VkResult res = r ? r(d, ci, a, out) : VK_ERROR_INITIALIZATION_FAILED;
+  logf("vkCreateSwapchainKHR -> %s (%d) swapchain=%p", vkres((int)res), (int)res, out ? (void*)*out : nullptr);
+  note("vkCreateSwapchainKHR", res);
+  return res;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL h_GetSwapchainImagesKHR(VkDevice d, VkSwapchainKHR sc, uint32_t* n, VkImage* imgs) {
+  static PFN_vkGetSwapchainImagesKHR r;
+  if (!r) r = devFn<PFN_vkGetSwapchainImagesKHR>("vkGetSwapchainImagesKHR");
+  VkResult res = r ? r(d, sc, n, imgs) : VK_ERROR_INITIALIZATION_FAILED;
+  static std::atomic<int> k{0};
+  if (k.fetch_add(1) < 6) logf("vkGetSwapchainImagesKHR(%s) count=%u -> %s", imgs ? "images" : "count", n ? *n : 0, vkres((int)res));
+  note("vkGetSwapchainImagesKHR", res);
+  return res;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL h_AcquireNextImageKHR(VkDevice d, VkSwapchainKHR sc, uint64_t timeout, VkSemaphore sem, VkFence fence,
+                                                     uint32_t* idx) {
+  static PFN_vkAcquireNextImageKHR r;
+  if (!r) r = devFn<PFN_vkAcquireNextImageKHR>("vkAcquireNextImageKHR");
+  VkResult res = r ? r(d, sc, timeout, sem, fence, idx) : VK_ERROR_INITIALIZATION_FAILED;
+  long n = ++g_nAcquire;
+  tracef("acquire#%ld sc=%p -> %s idx=%u", n, (void*)sc, vkres((int)res), idx ? *idx : 0u);
+  if (n <= 3) logf("vkAcquireNextImageKHR #%ld -> %s idx=%u", n, vkres((int)res), idx ? *idx : 0u);
+  note("vkAcquireNextImageKHR", res);
+  return res;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL h_QueuePresentKHR(VkQueue q, const VkPresentInfoKHR* pi) {
+  static PFN_vkQueuePresentKHR r;
+  if (!r) r = devFn<PFN_vkQueuePresentKHR>("vkQueuePresentKHR");
+  VkResult res = r ? r(q, pi) : VK_ERROR_INITIALIZATION_FAILED;
+  long n = ++g_nPresent;
+  tracef("present#%ld waitSems=%u swapchains=%u -> %s", n, pi ? pi->waitSemaphoreCount : 0u, pi ? pi->swapchainCount : 0u, vkres((int)res));
+  if (n <= 3) logf("vkQueuePresentKHR #%ld -> %s (pNext sTypes: %s)", n, vkres((int)res), pi ? pnextChain(pi->pNext).c_str() : "");
+  if (pi && pi->pResults)
+    for (uint32_t i = 0; i < pi->swapchainCount; i++) note("vkQueuePresentKHR(per-swapchain)", pi->pResults[i]);
+  note("vkQueuePresentKHR", res);
+  return res;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL h_QueueSubmit(VkQueue q, uint32_t cnt, const VkSubmitInfo* si, VkFence fence) {
+  static PFN_vkQueueSubmit r;
+  if (!r) r = devFn<PFN_vkQueueSubmit>("vkQueueSubmit");
+  uint32_t cbs = 0;
+  for (uint32_t i = 0; si && i < cnt; i++) cbs += si[i].commandBufferCount;
+  long n = ++g_nSubmit;
+  double t0 = nowSec();
+  VkResult res = r ? r(q, cnt, si, fence) : VK_ERROR_INITIALIZATION_FAILED;
+  double dt = nowSec() - t0;
+  tracef("submit#%ld queue=%p batches=%u cmdbufs=%u fence=%p -> %s (%.1f ms)", n, (void*)q, cnt, cbs, (void*)fence, vkres((int)res), dt * 1000);
+  if (n <= 3) logf("vkQueueSubmit #%ld batches=%u cmdbufs=%u -> %s", n, cnt, cbs, vkres((int)res));
+  if (dt > 0.25) logf("slow vkQueueSubmit #%ld took %.0f ms", n, dt * 1000);
+  note("vkQueueSubmit", res);
+  return res;
+}
+
+VkResult submit2Impl(const char* name, VkQueue q, uint32_t cnt, const VkSubmitInfo2* si, VkFence fence) {
+  static PFN_vkQueueSubmit2 r1, r2;
+  PFN_vkQueueSubmit2& r = !strcmp(name, "vkQueueSubmit2") ? r1 : r2;
+  if (!r) r = devFn<PFN_vkQueueSubmit2>(name);
+  long n = ++g_nSubmit;
+  double t0 = nowSec();
+  VkResult res = r ? r(q, cnt, si, fence) : VK_ERROR_INITIALIZATION_FAILED;
+  double dt = nowSec() - t0;
+  tracef("submit2#%ld queue=%p batches=%u fence=%p -> %s (%.1f ms)", n, (void*)q, cnt, (void*)fence, vkres((int)res), dt * 1000);
+  if (n <= 3) logf("%s #%ld batches=%u -> %s", name, n, cnt, vkres((int)res));
+  if (dt > 0.25) logf("slow %s #%ld took %.0f ms", name, n, dt * 1000);
+  note(name, res);
+  return res;
+}
+VKAPI_ATTR VkResult VKAPI_CALL h_QueueSubmit2(VkQueue q, uint32_t cnt, const VkSubmitInfo2* si, VkFence f) { return submit2Impl("vkQueueSubmit2", q, cnt, si, f); }
+VKAPI_ATTR VkResult VKAPI_CALL h_QueueSubmit2KHR(VkQueue q, uint32_t cnt, const VkSubmitInfo2* si, VkFence f) { return submit2Impl("vkQueueSubmit2KHR", q, cnt, si, f); }
+
+VKAPI_ATTR VkResult VKAPI_CALL h_WaitForFences(VkDevice d, uint32_t cnt, const VkFence* f, VkBool32 all, uint64_t timeout) {
+  static PFN_vkWaitForFences r;
+  if (!r) r = devFn<PFN_vkWaitForFences>("vkWaitForFences");
+  double t0 = nowSec();
+  VkResult res = r ? r(d, cnt, f, all, timeout) : VK_ERROR_INITIALIZATION_FAILED;
+  double dt = nowSec() - t0;
+  if (res != VK_SUCCESS || dt > 0.1) tracef("waitForFences n=%u all=%u timeout=%llu -> %s (%.1f ms)", cnt, (unsigned)all, (unsigned long long)timeout, vkres((int)res), dt * 1000);
+  if (dt > 1.0) logf("slow vkWaitForFences: %.0f ms -> %s", dt * 1000, vkres((int)res));
+  note("vkWaitForFences", res);
+  return res;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL h_QueueWaitIdle(VkQueue q) {
+  static PFN_vkQueueWaitIdle r;
+  if (!r) r = devFn<PFN_vkQueueWaitIdle>("vkQueueWaitIdle");
+  VkResult res = r ? r(q) : VK_ERROR_INITIALIZATION_FAILED;
+  tracef("queueWaitIdle queue=%p -> %s", (void*)q, vkres((int)res));
+  note("vkQueueWaitIdle", res);
+  return res;
+}
+VKAPI_ATTR VkResult VKAPI_CALL h_DeviceWaitIdle(VkDevice d) {
+  static PFN_vkDeviceWaitIdle r;
+  if (!r) r = devFn<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle");
+  VkResult res = r ? r(d) : VK_ERROR_INITIALIZATION_FAILED;
+  tracef("deviceWaitIdle -> %s", vkres((int)res));
+  note("vkDeviceWaitIdle", res);
+  return res;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL h_CreateGraphicsPipelines(VkDevice d, VkPipelineCache pc, uint32_t cnt, const VkGraphicsPipelineCreateInfo* ci,
+                                                         const VkAllocationCallbacks* a, VkPipeline* out) {
+  static PFN_vkCreateGraphicsPipelines r;
+  if (!r) r = devFn<PFN_vkCreateGraphicsPipelines>("vkCreateGraphicsPipelines");
+  double t0 = nowSec();
+  VkResult res = r ? r(d, pc, cnt, ci, a, out) : VK_ERROR_INITIALIZATION_FAILED;
+  double dt = nowSec() - t0;
+  long n = (g_nPipe += cnt);
+  tracef("createGraphicsPipelines n=%u total=%ld -> %s (%.1f ms)", cnt, n, vkres((int)res), dt * 1000);
+  static std::atomic<int> k{0};
+  int kk = k.fetch_add(1);
+  if (kk < 3 || kk % 100 == 0) logf("vkCreateGraphicsPipelines call #%d n=%u (total %ld) -> %s %.0f ms", kk, cnt, n, vkres((int)res), dt * 1000);
+  note("vkCreateGraphicsPipelines", res);
+  return res;
+}
+VKAPI_ATTR VkResult VKAPI_CALL h_CreateComputePipelines(VkDevice d, VkPipelineCache pc, uint32_t cnt, const VkComputePipelineCreateInfo* ci,
+                                                        const VkAllocationCallbacks* a, VkPipeline* out) {
+  static PFN_vkCreateComputePipelines r;
+  if (!r) r = devFn<PFN_vkCreateComputePipelines>("vkCreateComputePipelines");
+  double t0 = nowSec();
+  VkResult res = r ? r(d, pc, cnt, ci, a, out) : VK_ERROR_INITIALIZATION_FAILED;
+  double dt = nowSec() - t0;
+  long n = (g_nPipe += cnt);
+  tracef("createComputePipelines n=%u total=%ld -> %s (%.1f ms)", cnt, n, vkres((int)res), dt * 1000);
+  static std::atomic<int> k{0};
+  int kk = k.fetch_add(1);
+  if (kk < 3 || kk % 100 == 0) logf("vkCreateComputePipelines call #%d n=%u (total %ld) -> %s %.0f ms", kk, cnt, n, vkres((int)res), dt * 1000);
+  note("vkCreateComputePipelines", res);
+  return res;
+}
+VKAPI_ATTR VkResult VKAPI_CALL h_CreateShaderModule(VkDevice d, const VkShaderModuleCreateInfo* ci, const VkAllocationCallbacks* a,
+                                                    VkShaderModule* out) {
+  static PFN_vkCreateShaderModule r;
+  if (!r) r = devFn<PFN_vkCreateShaderModule>("vkCreateShaderModule");
+  VkResult res = r ? r(d, ci, a, out) : VK_ERROR_INITIALIZATION_FAILED;
+  long n = ++g_nShader;
+  tracef("createShaderModule#%ld codeSize=%zu -> %s", n, ci ? (size_t)ci->codeSize : (size_t)0, vkres((int)res));
+  note("vkCreateShaderModule", res);
+  return res;
+}
+VKAPI_ATTR VkResult VKAPI_CALL h_AllocateMemory(VkDevice d, const VkMemoryAllocateInfo* ai, const VkAllocationCallbacks* a, VkDeviceMemory* out) {
+  static PFN_vkAllocateMemory r;
+  if (!r) r = devFn<PFN_vkAllocateMemory>("vkAllocateMemory");
+  VkResult res = r ? r(d, ai, a, out) : VK_ERROR_INITIALIZATION_FAILED;
+  if (res != VK_SUCCESS) logf("vkAllocateMemory FAILED size=%llu memoryTypeIndex=%u -> %s", ai ? (unsigned long long)ai->allocationSize : 0ULL, ai ? ai->memoryTypeIndex : 0u, vkres((int)res));
+  else if (ai && ai->allocationSize >= (64ull << 20)) tracef("vkAllocateMemory size=%llu MB type=%u", (unsigned long long)(ai->allocationSize >> 20), ai->memoryTypeIndex);
+  note("vkAllocateMemory", res);
   return res;
 }
 
@@ -412,6 +766,21 @@ void* hookFor(const char* n) {
   if (!strcmp(n, "vkGetPhysicalDeviceProperties")) return (void*)h_GetPhysicalDeviceProperties;
   if (!strcmp(n, "vkGetPhysicalDeviceProperties2") || !strcmp(n, "vkGetPhysicalDeviceProperties2KHR"))
     return (void*)h_GetPhysicalDeviceProperties2;
+  if (!strcmp(n, "vkEnumerateDeviceExtensionProperties")) return (void*)h_EnumerateDeviceExtensionProperties;
+  if (!strcmp(n, "vkCreateSwapchainKHR")) return (void*)h_CreateSwapchainKHR;
+  if (!strcmp(n, "vkGetSwapchainImagesKHR")) return (void*)h_GetSwapchainImagesKHR;
+  if (!strcmp(n, "vkAcquireNextImageKHR")) return (void*)h_AcquireNextImageKHR;
+  if (!strcmp(n, "vkQueuePresentKHR")) return (void*)h_QueuePresentKHR;
+  if (!strcmp(n, "vkQueueSubmit")) return (void*)h_QueueSubmit;
+  if (!strcmp(n, "vkQueueSubmit2")) return (void*)h_QueueSubmit2;
+  if (!strcmp(n, "vkQueueSubmit2KHR")) return (void*)h_QueueSubmit2KHR;
+  if (!strcmp(n, "vkWaitForFences")) return (void*)h_WaitForFences;
+  if (!strcmp(n, "vkQueueWaitIdle")) return (void*)h_QueueWaitIdle;
+  if (!strcmp(n, "vkDeviceWaitIdle")) return (void*)h_DeviceWaitIdle;
+  if (!strcmp(n, "vkCreateGraphicsPipelines")) return (void*)h_CreateGraphicsPipelines;
+  if (!strcmp(n, "vkCreateComputePipelines")) return (void*)h_CreateComputePipelines;
+  if (!strcmp(n, "vkCreateShaderModule")) return (void*)h_CreateShaderModule;
+  if (!strcmp(n, "vkAllocateMemory")) return (void*)h_AllocateMemory;
   return nullptr;
 }
 
@@ -425,6 +794,8 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL h_GetInstanceProcAddr(VkInstance i, con
 }
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL h_GetDeviceProcAddr(VkDevice d, const char* n) {
   if (!n) return nullptr;
+  if (!strcmp(n, "vkGetDeviceProcAddr")) return (PFN_vkVoidFunction)h_GetDeviceProcAddr;
+  if (void* h = hookFor(n)) return (PFN_vkVoidFunction)h;
   PFN_vkVoidFunction r = real_gdpa ? real_gdpa(d, n) : nullptr;
   if (!r) logNull("GDPA", n);
   return r;
@@ -463,7 +834,7 @@ bool copyFile(const std::string& from, const std::string& to) {
 }
 
 void* loadVulkan() {
-  std::string tmp = g_intdir + "/files/vkshim_tmp";
+  std::string tmp = g_intdir + "/code_cache/vkshim_tmp";
   mkdirs(tmp);
   logf("tmpLibDir=%s exists=%d", tmp.c_str(), (int)exists(tmp));
   // driver can live next to the shim (preferred, packed into the APK as libvulkan_purple.so) ...
@@ -474,7 +845,7 @@ void* loadVulkan() {
   if (drvName.empty()) {
     std::string ext = g_logdir + "/../driver/vulkan.purple.so";
     if (exists(ext)) {
-      std::string dst = g_intdir + "/files/vkshim_driver";
+      std::string dst = g_intdir + "/code_cache/vkshim_driver";
       mkdirs(dst);
       logf("copying driver from %s to %s", ext.c_str(), dst.c_str());
       if (copyFile(ext, dst + "/vulkan.purple.so")) { drvDir = dst; drvName = "vulkan.purple.so"; }
@@ -485,7 +856,7 @@ void* loadVulkan() {
   } else {
     logf("driver: %s/%s size=%ld", drvDir.c_str(), drvName.c_str(), fsize(drvDir + "/" + drvName));
     logf("linkernsbypass_load_status()=%d (0 = adrenotools refuses to work)", (int)linkernsbypass_load_status());
-    std::string redir = g_intdir + "/files/vkshim_redirect";
+    std::string redir = g_intdir + "/code_cache/vkshim_redirect";
     mkdirs(redir);
     struct Try { const char* name; int flags; const char* tmpd; const char* redir; } tries[] = {
         {"A: CUSTOM, tmp dir", ADRENOTOOLS_DRIVER_CUSTOM, tmp.c_str(), nullptr},
@@ -552,7 +923,82 @@ void selfTest() {
   logf("---- selftest done ----");
 }
 
+// ------------------------------------------------------------------ tu_env.txt (editable settings, no rebuild needed)
+const char* kEnvTemplate =
+    "# vkshim settings. One KEY=VALUE per line. Lines starting with # are ignored.\n"
+    "# Changes take effect the next time the game starts - no rebuild needed.\n"
+    "# Try ONE experiment at a time: remove the # in front of one line, start the game,\n"
+    "# then look at vkshim.log. Flag names come from the Mesa Turnip driver; unknown ones are ignored.\n"
+    "#\n"
+    "# 1) draw frames straight into RAM (simpler, often more stable on weak Adreno chips)\n"
+    "#TU_DEBUG=sysmem\n"
+    "# 2) switch off an optimisation (LRZ) known to hang the GPU in some games\n"
+    "#TU_DEBUG=nolrz\n"
+    "# 3) switch off compressed framebuffers (UBWC)\n"
+    "#TU_DEBUG=noubwc\n"
+    "# 4) slow but strict: flush and wait after every draw, to find exactly where the GPU dies\n"
+    "#TU_DEBUG=flushall,syncdraw\n"
+    "# 5) flags can be combined with commas\n"
+    "#TU_DEBUG=sysmem,nolrz,noubwc\n"
+    "#\n"
+    "# Hide device extensions from the game (comma separated). Example: stops the game's frame-pacing\n"
+    "# library from using VK_GOOGLE_display_timing.\n"
+    "#HIDE_EXT=VK_GOOGLE_display_timing\n"
+    "#\n"
+    "# Write every submit/present/acquire call to vkshim.log (big log, only for deep debugging)\n"
+    "#VKSHIM_VERBOSE=1\n";
+
+std::string trimStr(std::string t) {
+  size_t a = t.find_first_not_of(" \t\r\n");
+  if (a == std::string::npos) return "";
+  size_t b = t.find_last_not_of(" \t\r\n");
+  return t.substr(a, b - a + 1);
+}
+
+void loadEnvConfig() {
+  if (g_logdir.empty()) return;
+  std::string path = g_logdir + "/tu_env.txt";
+  if (!exists(path)) {
+    int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0660);
+    if (fd >= 0) { (void)!write(fd, kEnvTemplate, strlen(kEnvTemplate)); close(fd); logf("created settings template %s", path.c_str()); }
+  }
+  std::string txt = readSmall(path.c_str(), 1 << 16);
+  if (txt.rfind("<open failed", 0) == 0) { logf("settings file %s not readable: %s", path.c_str(), txt.c_str()); return; }
+  int applied = 0;
+  size_t pos = 0;
+  while (pos <= txt.size()) {
+    size_t nl = txt.find('\n', pos);
+    std::string line = trimStr(txt.substr(pos, nl == std::string::npos ? std::string::npos : nl - pos));
+    pos = nl == std::string::npos ? txt.size() + 1 : nl + 1;
+    if (line.empty() || line[0] == '#') continue;
+    size_t eq = line.find('=');
+    if (eq == std::string::npos) { logf("settings: ignoring line without '=': %s", line.c_str()); continue; }
+    std::string k = trimStr(line.substr(0, eq)), v = trimStr(line.substr(eq + 1));
+    if (k.empty()) continue;
+    if (k == "HIDE_EXT") {
+      size_t q = 0;
+      while (q <= v.size()) {
+        size_t c = v.find(',', q);
+        std::string e = trimStr(v.substr(q, c == std::string::npos ? std::string::npos : c - q));
+        q = c == std::string::npos ? v.size() + 1 : c + 1;
+        if (!e.empty()) { g_hideExt.insert(e); logf("settings: hiding device extension %s", e.c_str()); }
+      }
+    } else if (k == "VKSHIM_VERBOSE") {
+      g_verbose = v != "0";
+      logf("settings: VKSHIM_VERBOSE=%d", (int)g_verbose);
+    } else {
+      setenv(k.c_str(), v.c_str(), 1);
+      logf("settings: setenv %s=%s", k.c_str(), v.c_str());
+    }
+    applied++;
+  }
+  if (!applied) logf("settings: %s has no active lines (baseline run, driver defaults)", path.c_str());
+  const char* t = getenv("TU_DEBUG");
+  logf("settings: effective TU_DEBUG=%s", t ? t : "(unset)");
+}
+
 void lazyInit() {
+  loadEnvConfig();
   logf("lazyInit: first Vulkan call from the game; loading driver now (linkernsbypass_load_status=%d)",
        (int)linkernsbypass_load_status());
   g_vk = loadVulkan();
@@ -577,7 +1023,12 @@ void lazyInit() {
 __attribute__((constructor)) void shimInit() {
   initPaths();
   installCrashHandlers();
+  logf("vkshim build: v3-diag (swapchain/submit/present/pipeline result logging, tu_env.txt settings)");
   environmentReport();
+  {  // safety net: normally libdatalink.so (loaded from Java) already did this; running again is a no-op
+    datalink::Ctx dc;
+    if (datalink::detect(dc)) logf("datalink (from shim): %d folder(s) linked, see Android/media/%s/datalink.log", datalink::run(dc), g_pkg.c_str());
+  }
   logf("constructor done; driver load is deferred to the first vk call so libadrenotools' own static init has run");
 }
 }  // namespace
