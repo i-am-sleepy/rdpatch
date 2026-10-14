@@ -3,6 +3,7 @@
 // /storage/emulated/0/Android/media/<pkg>/<name>  (the real files live there, editable with any file manager).
 // Header-only so it can be used by libdatalink.so and by libvkshim.so (idempotent: second run is a no-op).
 #pragma once
+#include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fnmatch.h>
@@ -179,13 +180,23 @@ inline std::vector<std::string> readLines(const std::string& p) {
 static const char* kDefaultCfg =
     "# datalink.cfg - edit, then restart the game (changes apply on next launch)\n"
     "# Everything under /data/data/<pkg> is moved to this media folder, except what is excluded.\n"
-    "# Lines:  include <path> | exclude <pattern> | maxmb <N> | off\n"
+    "# Lines:  include <path> | exclude <pattern> | maxmb <N> | find <name-pattern> | off\n"
     "#   paths are relative to /data/data/<pkg>, e.g.  files/options.xml   (alias: includefile / file)\n"
     "#   exclude takes * wildcards, e.g.  exclude files/assetpacks   exclude files/*.tmp\n"
     "# A folder is linked as a whole when it is smaller than maxmb and has no excluded content.\n"
     "# Otherwise it stays a real folder and its files/subfolders are linked one by one (big or excluded parts stay put).\n"
     "# New files the game creates are moved here on the next launch.\n"
     "# 'off' stops any new linking (existing links stay; to undo, clear app data or delete the symlinks)\n"
+    "# 'find <pattern>' (repeatable, * wildcards, case-insensitive) searches the WHOLE app data folder\n"
+    "# (including excluded folders) for matching file/folder names and lists them in datalink.log, without\n"
+    "# copying or linking anything. Use this to locate a file before writing an 'include' line for it,\n"
+    "# e.g.  find tune_android.rpf   then remove the find line again once you have the path.\n"
+    "# An include line reaches into an excluded parent folder for that ONE file; it does not pull in\n"
+    "# anything else from that folder.\n"
+    "#\n"
+    "# find <name or *wildcard*>  - searches the WHOLE data folder (including excluded paths) for files or\n"
+    "# folders whose name matches, and writes every match to datalink.log. Nothing is copied or linked by this.\n"
+    "# Example:  find *tune*android*.rpf\n"
     "include files\n"
     "exclude cache\n"
     "exclude code_cache\n"
@@ -217,10 +228,59 @@ struct State {
   std::vector<std::string> exc;  // from datalink.cfg (a folder that contains such paths is never linked as a whole)
   std::vector<std::string> bi;   // built-in excludes
   std::set<std::string> inc;
+  std::vector<std::string> find;  // from cfg 'find <pattern>' lines - name search only, nothing is copied
   int links = 0;
 };
 
-inline void handleEntry(Ctx& c, State& st, const std::string& rel, bool top);
+inline std::string lower(std::string v) { for (auto& ch : v) ch = (char)tolower((unsigned char)ch); return v; }
+
+// Read-only recursive name search over the WHOLE app data folder, ignoring exclude rules on purpose (this never
+// copies or links anything - it only reports where a file/folder lives so you can write an 'include' line for it).
+// Does not follow symlinks (so it never descends into media-linked folders, and can't loop).
+inline void findWalk(Ctx& c, const std::string& dirRel, const std::vector<std::string>& pats, int& visited, int& hits) {
+  if (visited > 400000 || hits >= 300) return;
+  std::string dirAbs = c.intdir + (dirRel.empty() ? "" : "/" + dirRel);
+  for (auto& n : listNames(dirAbs)) {
+    if (visited++ > 400000) { L(c, "find: stopped early, too many files under the app data folder"); return; }
+    std::string rel = dirRel.empty() ? n : dirRel + "/" + n;
+    // always skip our own scratch/profile folders - never useful to a 'find'
+    bool skip = false;
+    for (const char* b : {"vkshim_tmp", "vkshim_redirect", "vkshim_logs"}) if (n == b) skip = true;
+    if (skip) continue;
+    std::string abs = c.intdir + "/" + rel;
+    struct stat ls;
+    if (lstat(abs.c_str(), &ls) != 0) continue;
+    std::string lname = lower(n);
+    for (auto& pat : pats) {
+      if (fnmatch(lower(pat).c_str(), lname.c_str(), 0) == 0) {
+        if (S_ISLNK(ls.st_mode)) {
+          char t[512] = {0};
+          ssize_t r = readlink(abs.c_str(), t, sizeof t - 1);
+          L(c, "find: MATCH %s  (symlink -> %s)", rel.c_str(), r > 0 ? t : "?");
+        } else if (S_ISDIR(ls.st_mode)) {
+          L(c, "find: MATCH %s/  (folder)", rel.c_str());
+        } else {
+          L(c, "find: MATCH %s  (%lld bytes)", rel.c_str(), (long long)ls.st_size);
+        }
+        hits++;
+        break;
+      }
+    }
+    if (S_ISDIR(ls.st_mode) && !S_ISLNK(ls.st_mode)) findWalk(c, rel, pats, visited, hits);
+    if (hits >= 300) { L(c, "find: stopped early, too many matches (300+)"); return; }
+  }
+}
+inline void runFind(Ctx& c, const std::vector<std::string>& pats) {
+  if (pats.empty()) return;
+  std::string plist;
+  for (auto& p : pats) plist += p + " ";
+  L(c, "---- find: searching the whole app data folder for: %s ----", plist.c_str());
+  int visited = 0, hits = 0;
+  findWalk(c, "", pats, visited, hits);
+  L(c, "find: %d match(es), %d entries scanned", hits, visited);
+}
+
+inline void handleEntry(Ctx& c, State& st, const std::string& rel, bool top, bool force = false);
 
 inline bool verifyCopy(const std::string& a, const std::string& b) {
   struct stat sa, sb;
@@ -284,8 +344,8 @@ inline void linkDirWhole(Ctx& c, State& st, const std::string& rel, const std::s
   st.links++;
 }
 
-inline void handleEntry(Ctx& c, State& st, const std::string& rel, bool top) {
-  if (matchExcluded(st.exc, rel) || matchExcluded(st.bi, rel)) { if (top || std::count(rel.begin(), rel.end(), '/') < 2) L(c, "[%s] excluded", rel.c_str()); return; }
+inline void handleEntry(Ctx& c, State& st, const std::string& rel, bool top, bool force) {
+  if (!force && (matchExcluded(st.exc, rel) || matchExcluded(st.bi, rel))) { if (top || std::count(rel.begin(), rel.end(), '/') < 2) L(c, "[%s] excluded", rel.c_str()); return; }
   std::string src = c.intdir + "/" + rel, dst = c.mediadir + "/" + rel;
   struct stat ls;
   bool hasS = lstat(src.c_str(), &ls) == 0;
@@ -355,6 +415,7 @@ inline int run(Ctx& c) {
     else if (n == 2 && (!strcmp(a, "include") || !strcmp(a, "includefile") || !strcmp(a, "file"))) st.inc.insert(b);
     else if (n == 2 && !strcmp(a, "exclude")) st.exc.push_back(b);
     else if (n == 2 && !strcmp(a, "maxmb")) c.maxBytes = atoll(b) << 20;
+    else if (n == 2 && !strcmp(a, "find")) st.find.push_back(b);
     else L(c, "cfg: ignored line '%s'", line.c_str());
   }
   if (off) { L(c, "cfg says 'off' - not linking anything"); if (c.log) fclose(c.log); c.log = nullptr; return 0; }
@@ -371,8 +432,9 @@ inline int run(Ctx& c) {
     bool parentLink = false;
     size_t pos = 0;
     while ((pos = i.find('/', pos)) != std::string::npos) { if (isLink(c.intdir + "/" + i.substr(0, pos))) parentLink = true; pos++; }
-    if (!parentLink) handleEntry(c, st, i, false);
+    if (!parentLink) handleEntry(c, st, i, false, /*force=*/true);
   }
+  runFind(c, st.find);
   L(c, "---- layout of %s (depth 3) ----", c.intdir.c_str());
   int budget = 400;
   tree(c, c.intdir, 1, 3, budget, "  ");
